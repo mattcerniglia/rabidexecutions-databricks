@@ -772,7 +772,7 @@ fn main() {
     let lk_files = load("links");
     lap("mapped");
     if let Ok(mode) = std::env::var("SS_MODE") {
-        let ech = chunks(&ev_files, 4 << 20);
+        let ech = chunks(&ev_files, 2 << 20);
         let mut sc = Scratch::default();
         let t = Instant::now();
         let mut cnt = 0u64;
@@ -813,7 +813,7 @@ fn main() {
     }
 
 
-    let ech = chunks(&ev_files, 4 << 20);
+    let ech = chunks(&ev_files, 2 << 20);
     let ev_run = || -> Vec<Vec<Vec<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>()), |st, t| {
         let (fi, s, e) = ech[t];
         populate(&ev_files[fi][s..e]);
@@ -961,12 +961,16 @@ fn main() {
         pq::Spec { name: "top_category", kind: pq::Kind::Str, optional: true },
     ];
     let ncat = catnames.len();
+    // heaviest partitions first (whales), so no big task is left for the tail
+    let mut order3: Vec<usize> = (0..NP).collect();
+    order3.sort_by_key(|&p| std::cmp::Reverse(pes.iter().map(|t| t[p].len()).sum::<usize>() + cks.iter().map(|t| t[p].len()).sum::<usize>()));
     let p3s: Vec<P3> = par(nt, NP, || P3 {
         acc: vec![[0; 4]; (ncamp + 1) * nd],
         cnt: vec![0; ncamp + 1],
         pos: vec![0; ncamp + 1],
         ..Default::default()
-    }, |st, p| {
+    }, |st, t_idx| {
+        let p = order3[t_idx];
         let mut ev = std::mem::take(&mut st.ev);
         ev.clear();
         ev.reserve(pes.iter().map(|t| t[p].len()).sum());
@@ -979,6 +983,7 @@ fn main() {
         for t in &cks {
             ck.extend_from_slice(&t[p]);
         }
+        let tp0 = Instant::now();
         let mut g = std::mem::take(&mut st.g);
         // group events by person with a hash table (O(n)), clicks join the same groups
         let n = ev.len();
@@ -1072,11 +1077,15 @@ fn main() {
         let mut u_ev = std::mem::take(&mut st.u_ev);
         let mut u_rev = std::mem::take(&mut st.u_rev);
         let mut u_top = std::mem::take(&mut st.u_top);
+        let tp1 = tp0.elapsed();
+        let mut t_sort = std::time::Duration::ZERO;
         for gi in 0..ng {
             let (a, b) = (g.start[gi] as usize, g.start[gi + 1] as usize);
             let (ca, cb) = (g.cstart[gi] as usize, g.cstart[gi + 1] as usize);
+            let ts0 = Instant::now();
             sort_ts(&mut g.sev[a..b], |r: &Pe| r.ts);
             sort_ts(&mut g.sck[ca..cb], |c: &Ck| c.ts);
+            t_sort += ts0.elapsed();
             let es = &g.sev[a..b];
             let cs = &g.sck[ca..cb];
             let _t_person = WhaleTimer(if es.len() > 3000 && std::env::var("SS_WHALE").is_ok() { Some(Instant::now()) } else { None }, es.len(), cs.len());
@@ -1247,6 +1256,9 @@ fn main() {
                     }
                 }
             }
+        }
+        if std::env::var("SS_TASKS").is_ok() && tp0.elapsed().as_millis() > 25 {
+            eprintln!("  p3 task {}: {} ev {} ck {} groups: build {:.1}ms sort {:.1}ms total {:.1}ms", p, n, ck.len(), ng, tp1.as_secs_f64() * 1e3, t_sort.as_secs_f64() * 1e3, tp0.elapsed().as_secs_f64() * 1e3);
         }
         if u_name.len() >= FLUSH_ROWS {
             flush_users(&udir, &ud_specs, &catnames, &u_name, &u_day, &u_sess, &u_ev, &u_rev, &u_top);
