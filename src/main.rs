@@ -626,34 +626,9 @@ fn main() {
     let lk_files = load("links");
     lap("mapped");
 
-    let links = build_links(&lk_files, nt);
-    lap("links");
 
-    // clicks
-    let cch = chunks(&ck_files, 4 << 20);
-    let cks: Vec<Vec<Vec<Ck>>> = par(nt, cch.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ck>>>()), |st, t| {
-        let (fi, s, e) = cch[t];
-        populate(&ck_files[fi][s..e]);
-        let (sc, st) = st;
-        lines::<4>(&ck_files[fi][s..e], sc, |[cid, user, cmp, ts]| {
-            if cid.is_empty() || user.is_empty() {
-                return;
-            }
-            let Some(ts) = parse_ts(ts) else { return };
-            if ts < ws - WEEK || ts >= we {
-                return;
-            }
-            let Some(c) = campaigns.get(cmp) else { return };
-            let uh = hash(user);
-            let key = links.get(uh).map_or(uh, |v| v[0]);
-            st[(key >> 56) as usize].push(Ck { key, ts, cid: pack(cid), camp: c });
-        });
-    }).into_iter().map(|x| x.1).collect();
-    lap("clicks parsed");
-
-    // events pass 1
     let ech = chunks(&ev_files, 4 << 20);
-    let evs: Vec<Vec<Vec<Ev1>>> = par(nt, ech.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>()), |st, t| {
+    let ev_run = || -> Vec<Vec<Vec<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>()), |st, t| {
         let (fi, s, e) = ech[t];
         populate(&ev_files[fi][s..e]);
         let (sc, st) = st;
@@ -692,8 +667,36 @@ fn main() {
             let idh = hash(id);
             st[(idh >> 56) as usize].push(Ev1 { id: idh, user: hash(user), ts: tsx, ing, uptr: pack(user), price: pv, cat, kind, valid });
         });
+    }).into_iter().map(|x| x.1).collect() };
+    let (links, evs) = std::thread::scope(|s| {
+        let h = s.spawn(|| build_links(&lk_files, 2));
+        let evs = ev_run();
+        (h.join().unwrap(), evs)
+    });
+    lap("links + events parsed");
+
+    // clicks
+    let cch = chunks(&ck_files, 4 << 20);
+    let cks: Vec<Vec<Vec<Ck>>> = par(nt, cch.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ck>>>()), |st, t| {
+        let (fi, s, e) = cch[t];
+        populate(&ck_files[fi][s..e]);
+        let (sc, st) = st;
+        lines::<4>(&ck_files[fi][s..e], sc, |[cid, user, cmp, ts]| {
+            if cid.is_empty() || user.is_empty() {
+                return;
+            }
+            let Some(ts) = parse_ts(ts) else { return };
+            if ts < ws - WEEK || ts >= we {
+                return;
+            }
+            let Some(c) = campaigns.get(cmp) else { return };
+            let uh = hash(user);
+            let key = links.get(uh).map_or(uh, |v| v[0]);
+            st[(key >> 56) as usize].push(Ck { key, ts, cid: pack(cid), camp: c });
+        });
     }).into_iter().map(|x| x.1).collect();
-    lap("events parsed");
+    lap("clicks parsed");
+
 
     // pass 2: dedup, validate, person-map, scatter by person
     let pes: Vec<Vec<Vec<Pe>>> = par(nt, NP, || (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Pe>>>(), |st, p| {
@@ -743,7 +746,7 @@ fn main() {
             st[(key >> 56) as usize].push(Pe { key, ts: r.ts, name, price: r.price, cat: r.cat, kind: r.kind });
         }
     });
-    drop(evs);
+    std::mem::forget(evs);
     lap("dedup");
 
     // pass 3
