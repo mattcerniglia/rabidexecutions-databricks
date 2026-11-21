@@ -398,6 +398,13 @@ struct LinkTab {
     vals: Vec<[u64; 2]>, // person key, name ptr
 }
 impl LinkTab {
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        unsafe {
+            let i = (h as usize) & self.mask;
+            std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
     #[inline]
     fn get(&self, h: u64) -> Option<[u64; 2]> {
         let mut i = (h as usize) & self.mask;
@@ -558,9 +565,10 @@ fn main() {
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |s: &str| {
         if verbose {
-            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
-            eprintln!("[{:7.3}s wall {:7.3}s cpu] {}", t0.elapsed().as_secs_f64(), ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9, s);
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let f = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+            eprintln!("[{:7.3}s wall  user {:6.3}  sys {:6.3}  minflt {}] {}", t0.elapsed().as_secs_f64(), f(ru.ru_utime), f(ru.ru_stime), ru.ru_minflt, s);
         }
     };
 
@@ -716,14 +724,18 @@ fn main() {
                 s = (s + 1) & mask;
             }
         }
+        let mut surv: Vec<u32> = Vec::with_capacity(v.len());
         for &j in &tab {
-            if j == u32::MAX {
-                continue;
+            if j != u32::MAX && v[j as usize].valid {
+                surv.push(j);
             }
-            let r = v[j as usize];
-            if !r.valid {
-                continue;
+        }
+        const LA: usize = 8;
+        for k in 0..surv.len() {
+            if k + LA < surv.len() {
+                links.prefetch(v[surv[k + LA] as usize].user);
             }
+            let r = v[surv[k] as usize];
             let (key, name) = match links.get(r.user) {
                 Some(x) => (x[0], x[1]),
                 None => (r.user, r.uptr),
