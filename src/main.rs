@@ -548,7 +548,7 @@ fn write_file(dir: &Path, name: &str, bytes: Vec<u8>) {
 struct S2 {
     out: Vec<Vec<Pe>>,
     v: Vec<Ev1>,
-    tab: Vec<u32>,
+    tab: Vec<u64>,
     surv: Vec<u32>,
 }
 #[derive(Default)]
@@ -762,30 +762,37 @@ fn main() {
         let cap = (v.len() * 2 + 2).next_power_of_two();
         let mask = cap - 1;
         tab.clear();
-        tab.resize(cap, u32::MAX);
+        tab.resize(cap, u64::MAX);
         for i in 0..v.len() {
             let id = v[i].id;
+            let tag = (id >> 32) & 0xFFFF_FFFF;
             let mut s = ((id >> 8) as usize) & mask;
             loop {
-                let j = tab[s];
-                if j == u32::MAX {
-                    tab[s] = i as u32;
+                let e = tab[s];
+                if e == u64::MAX {
+                    tab[s] = (tag << 32) | i as u64;
                     break;
                 }
-                let o = &v[j as usize];
-                if o.id == id {
-                    if v[i].ing < o.ing {
-                        tab[s] = i as u32;
+                if e >> 32 == tag {
+                    let j = (e & 0xFFFF_FFFF) as usize;
+                    if v[j].id == id {
+                        // duplicate event_id: the smaller ingest_ts copy survives (even if invalid)
+                        if v[i].ing < v[j].ing {
+                            v[j].valid = false;
+                            tab[s] = (tag << 32) | i as u64;
+                        } else {
+                            v[i].valid = false;
+                        }
+                        break;
                     }
-                    break;
                 }
                 s = (s + 1) & mask;
             }
         }
         surv.clear();
-        for &j in tab.iter() {
-            if j != u32::MAX && v[j as usize].valid {
-                surv.push(j);
+        for (i, r) in v.iter().enumerate() {
+            if r.valid {
+                surv.push(i as u32);
             }
         }
         const LA: usize = 8;
