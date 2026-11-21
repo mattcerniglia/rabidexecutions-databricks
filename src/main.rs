@@ -569,15 +569,33 @@ fn main() {
         for t in &evs {
             v.extend_from_slice(&t[p]);
         }
-        v.sort_unstable_by(|a, b| a.id.cmp(&b.id).then(a.ing.cmp(&b.ing)));
-        let mut i = 0;
-        while i < v.len() {
-            let r = v[i];
-            let mut j = i + 1;
-            while j < v.len() && v[j].id == r.id {
-                j += 1;
+        let cap = (v.len() * 2 + 2).next_power_of_two();
+        let mask = cap - 1;
+        let mut tab = vec![u32::MAX; cap];
+        for i in 0..v.len() {
+            let id = v[i].id;
+            let mut s = ((id >> 8) as usize) & mask;
+            loop {
+                let j = tab[s];
+                if j == u32::MAX {
+                    tab[s] = i as u32;
+                    break;
+                }
+                let o = &v[j as usize];
+                if o.id == id {
+                    if v[i].ing < o.ing {
+                        tab[s] = i as u32;
+                    }
+                    break;
+                }
+                s = (s + 1) & mask;
             }
-            i = j;
+        }
+        for &j in &tab {
+            if j == u32::MAX {
+                continue;
+            }
+            let r = v[j as usize];
             if !r.valid {
                 continue;
             }
