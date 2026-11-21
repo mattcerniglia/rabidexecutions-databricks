@@ -545,7 +545,22 @@ fn write_file(dir: &Path, name: &str, bytes: Vec<u8>) {
     std::fs::write(dir.join(name), bytes).expect("write");
 }
 
+struct S2 {
+    out: Vec<Vec<Pe>>,
+    v: Vec<Ev1>,
+    tab: Vec<u32>,
+    surv: Vec<u32>,
+}
+#[derive(Default)]
 struct P3 {
+    ev: Vec<Pe>,
+    ck: Vec<Ck>,
+    u_name: Vec<u64>,
+    u_day: Vec<i32>,
+    u_sess: Vec<i32>,
+    u_ev: Vec<i32>,
+    u_rev: Vec<i64>,
+    u_top: Vec<u8>,
     acc: Vec<[u64; 4]>,
     cnt: Vec<u32>,
     pos: Vec<u32>,
@@ -625,6 +640,43 @@ fn main() {
     let ck_files = load("clicks");
     let lk_files = load("links");
     lap("mapped");
+    if let Ok(mode) = std::env::var("SS_MODE") {
+        let ech = chunks(&ev_files, 4 << 20);
+        let mut sc = Scratch::default();
+        let t = Instant::now();
+        let mut cnt = 0u64;
+        let mut chk = 0u64;
+        for &(fi, s, e) in &ech {
+            let d = &ev_files[fi][s..e];
+            match mode.as_str() {
+                "memchr" => {
+                    for_lines(d, |l| {
+                        cnt += 1;
+                        chk += l.len() as u64;
+                    });
+                }
+                "scan" => {
+                    scan(d, &mut sc);
+                    cnt += sc.nl.len() as u64;
+                }
+                "lines" => lines::<7>(d, &mut sc, |f| {
+                    cnt += 1;
+                    chk += f[0].len() as u64;
+                }),
+                "hash" => lines::<7>(d, &mut sc, |f| {
+                    cnt += 1;
+                    chk += hash(f[0]) ^ hash(f[1]);
+                }),
+                "ts" => lines::<7>(d, &mut sc, |f| {
+                    cnt += 1;
+                    chk += parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64;
+                }),
+                _ => {}
+            }
+        }
+        eprintln!("{mode}: {:.3}s for {cnt} lines ({:.1} ns/line) chk={chk}", t.elapsed().as_secs_f64(), t.elapsed().as_secs_f64() * 1e9 / cnt as f64);
+        return;
+    }
 
 
     let ech = chunks(&ev_files, 4 << 20);
@@ -699,15 +751,18 @@ fn main() {
 
 
     // pass 2: dedup, validate, person-map, scatter by person
-    let pes: Vec<Vec<Vec<Pe>>> = par(nt, NP, || (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Pe>>>(), |st, p| {
+    let pes: Vec<Vec<Vec<Pe>>> = par(nt, NP, || S2 { out: (0..NP).map(|_| Vec::new()).collect(), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
+        let S2 { out: st, v, tab, surv } = s2;
         let n: usize = evs.iter().map(|t| t[p].len()).sum();
-        let mut v: Vec<Ev1> = Vec::with_capacity(n);
+        v.clear();
+        v.reserve(n);
         for t in &evs {
             v.extend_from_slice(&t[p]);
         }
         let cap = (v.len() * 2 + 2).next_power_of_two();
         let mask = cap - 1;
-        let mut tab = vec![u32::MAX; cap];
+        tab.clear();
+        tab.resize(cap, u32::MAX);
         for i in 0..v.len() {
             let id = v[i].id;
             let mut s = ((id >> 8) as usize) & mask;
@@ -727,8 +782,8 @@ fn main() {
                 s = (s + 1) & mask;
             }
         }
-        let mut surv: Vec<u32> = Vec::with_capacity(v.len());
-        for &j in &tab {
+        surv.clear();
+        for &j in tab.iter() {
             if j != u32::MAX && v[j as usize].valid {
                 surv.push(j);
             }
@@ -745,7 +800,7 @@ fn main() {
             };
             st[(key >> 56) as usize].push(Pe { key, ts: r.ts, name, price: r.price, cat: r.cat, kind: r.kind });
         }
-    });
+    }).into_iter().map(|s| s.out).collect();
     std::mem::forget(evs);
     lap("dedup");
 
@@ -769,24 +824,28 @@ fn main() {
         acc: vec![[0; 4]; (ncamp + 1) * nd],
         cnt: vec![0; ncamp + 1],
         pos: vec![0; ncamp + 1],
-        active: vec![],
+        ..Default::default()
     }, |st, p| {
-        let mut ev: Vec<Pe> = Vec::with_capacity(pes.iter().map(|t| t[p].len()).sum());
+        let mut ev = std::mem::take(&mut st.ev);
+        ev.clear();
+        ev.reserve(pes.iter().map(|t| t[p].len()).sum());
         for t in &pes {
             ev.extend_from_slice(&t[p]);
         }
-        let mut ck: Vec<Ck> = Vec::with_capacity(cks.iter().map(|t| t[p].len()).sum());
+        let mut ck = std::mem::take(&mut st.ck);
+        ck.clear();
+        ck.reserve(cks.iter().map(|t| t[p].len()).sum());
         for t in &cks {
             ck.extend_from_slice(&t[p]);
         }
         ev.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.ts.cmp(&b.ts)));
         ck.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.ts.cmp(&b.ts)));
-        let mut u_name: Vec<u64> = vec![];
-        let mut u_day: Vec<i32> = vec![];
-        let mut u_sess: Vec<i32> = vec![];
-        let mut u_ev: Vec<i32> = vec![];
-        let mut u_rev: Vec<i64> = vec![];
-        let mut u_top: Vec<u8> = vec![];
+        let mut u_name = std::mem::take(&mut st.u_name);
+        let mut u_day = std::mem::take(&mut st.u_day);
+        let mut u_sess = std::mem::take(&mut st.u_sess);
+        let mut u_ev = std::mem::take(&mut st.u_ev);
+        let mut u_rev = std::mem::take(&mut st.u_rev);
+        let mut u_top = std::mem::take(&mut st.u_top);
         let mut i = 0;
         let mut cj = 0;
         while i < ev.len() {
@@ -925,19 +984,32 @@ fn main() {
                 }
             }
         }
-        if !u_name.is_empty() || p == 0 {
-            let n = u_name.len();
-            let tops: Vec<Option<B>> = u_top.iter().map(|&t| if t == 255 { None } else { Some(catnames[t as usize]) }).collect();
-            let pages = [
-                pq::str_page(u_name.iter().map(|&p| unpack(p)), n),
-                pq::i32_page(&u_day),
-                pq::i32_page(&u_sess),
-                pq::i32_page(&u_ev),
-                pq::i64_page(&u_rev),
-                pq::opt_str_page(&tops),
-            ];
-            write_file(&udir, &format!("part-{:03}.parquet", p), pq::file_bytes(&ud_specs, &pages, n));
+        st.ev = ev;
+        st.ck = ck;
+        st.u_name = u_name;
+        st.u_day = u_day;
+        st.u_sess = u_sess;
+        st.u_ev = u_ev;
+        st.u_rev = u_rev;
+        st.u_top = u_top;
+    });
+    // one parquet file per worker state, written in parallel
+    par(nt, p3s.len(), || (), |_, t| {
+        let s = &p3s[t];
+        let n = s.u_name.len();
+        if n == 0 && t != 0 {
+            return;
         }
+        let tops: Vec<Option<B>> = s.u_top.iter().map(|&t| if t == 255 { None } else { Some(catnames[t as usize]) }).collect();
+        let pages = [
+            pq::str_page(s.u_name.iter().map(|&p| unpack(p)), n),
+            pq::i32_page(&s.u_day),
+            pq::i32_page(&s.u_sess),
+            pq::i32_page(&s.u_ev),
+            pq::i64_page(&s.u_rev),
+            pq::opt_str_page(&tops),
+        ];
+        write_file(&udir, &format!("part-{:03}.parquet", t), pq::file_bytes(&ud_specs, &pages, n));
     });
     lap("sessions + user_daily");
 
