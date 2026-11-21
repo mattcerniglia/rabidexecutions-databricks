@@ -615,6 +615,29 @@ fn main() {
         .ok()
         .filter(|&n: &usize| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
+    // Ask the kernel to start reading every input file right away (async, deep queue);
+    // events largest-first, which is the order the chunk tasks consume them.
+    {
+        let mut files: Vec<(u64, PathBuf)> = vec![];
+        for sub in ["events", "clicks", "links"] {
+            for p in list_csv(&data.join(sub)) {
+                let sz = std::fs::metadata(&p).map_or(0, |m| m.len());
+                files.push((if sub == "events" { u64::MAX / 2 + sz } else if sub == "clicks" { u64::MAX / 4 + sz } else { sz }, p));
+            }
+        }
+        files.sort_by_key(|f| std::cmp::Reverse(f.0));
+        std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            for (_, p) in files {
+                if let Ok(f) = std::fs::File::open(&p) {
+                    // SAFETY: plain syscall on a valid, open file descriptor; offset/len 0 = whole file.
+                    unsafe {
+                        libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+                    }
+                }
+            }
+        });
+    }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |s: &str| {
         if verbose {
