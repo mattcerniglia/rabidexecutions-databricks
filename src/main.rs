@@ -552,7 +552,39 @@ struct S2 {
     surv: Vec<u32>,
 }
 #[derive(Default)]
+struct Grp {
+    tkey: Vec<u64>,
+    tgid: Vec<u32>,
+    evg: Vec<u32>,
+    cnt: Vec<u32>,
+    start: Vec<u32>,
+    cur: Vec<u32>,
+    sev: Vec<Pe>,
+    cgid: Vec<u32>,
+    ccnt: Vec<u32>,
+    cstart: Vec<u32>,
+    ccur: Vec<u32>,
+    sck: Vec<Ck>,
+}
+fn sort_ts<T: Copy>(v: &mut [T], f: impl Fn(&T) -> i64 + Copy) {
+    if v.len() <= 24 {
+        for i in 1..v.len() {
+            let x = v[i];
+            let kx = f(&x);
+            let mut j = i;
+            while j > 0 && f(&v[j - 1]) > kx {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = x;
+        }
+    } else {
+        v.sort_unstable_by_key(|x| f(x));
+    }
+}
+#[derive(Default)]
 struct P3 {
+    g: Grp,
     ev: Vec<Pe>,
     ck: Vec<Ck>,
     u_name: Vec<u64>,
@@ -648,6 +680,9 @@ fn main() {
         let mut chk = 0u64;
         for &(fi, s, e) in &ech {
             let d = &ev_files[fi][s..e];
+            if std::env::var("SS_POP").is_ok() {
+                populate(d);
+            }
             match mode.as_str() {
                 "memchr" => {
                     for_lines(d, |l| {
@@ -845,33 +880,106 @@ fn main() {
         for t in &cks {
             ck.extend_from_slice(&t[p]);
         }
-        ev.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.ts.cmp(&b.ts)));
-        ck.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.ts.cmp(&b.ts)));
+        let mut g = std::mem::take(&mut st.g);
+        // group events by person with a hash table (O(n)), clicks join the same groups
+        let n = ev.len();
+        let cap = (n * 2 + 2).next_power_of_two();
+        let mask = cap - 1;
+        g.tkey.clear();
+        g.tkey.resize(cap, 0);
+        g.tgid.clear();
+        g.tgid.resize(cap, 0);
+        g.evg.clear();
+        g.cnt.clear();
+        for r in ev.iter() {
+            let mut s = (r.key as usize) & mask;
+            let gi = loop {
+                let k = g.tkey[s];
+                if k == r.key {
+                    break g.tgid[s];
+                }
+                if k == 0 {
+                    let id = g.cnt.len() as u32;
+                    g.tkey[s] = r.key;
+                    g.tgid[s] = id;
+                    g.cnt.push(0);
+                    break id;
+                }
+                s = (s + 1) & mask;
+            };
+            g.evg.push(gi);
+            g.cnt[gi as usize] += 1;
+        }
+        let ng = g.cnt.len();
+        g.start.clear();
+        let mut run = 0u32;
+        for &c in g.cnt.iter() {
+            g.start.push(run);
+            run += c;
+        }
+        g.start.push(run);
+        g.cur.clear();
+        g.cur.extend_from_slice(&g.start[..ng]);
+        g.sev.clear();
+        g.sev.resize(n, Pe { key: 0, ts: 0, name: 0, price: 0, cat: 0, kind: 0 });
+        for (i, r) in ev.iter().enumerate() {
+            let gi = g.evg[i] as usize;
+            let p = g.cur[gi] as usize;
+            g.sev[p] = *r;
+            g.cur[gi] += 1;
+        }
+        g.ccnt.clear();
+        g.ccnt.resize(ng, 0);
+        g.cgid.clear();
+        for c in ck.iter() {
+            let mut s = (c.key as usize) & mask;
+            let gi = loop {
+                let k = g.tkey[s];
+                if k == c.key {
+                    break g.tgid[s];
+                }
+                if k == 0 {
+                    break u32::MAX;
+                }
+                s = (s + 1) & mask;
+            };
+            g.cgid.push(gi);
+            if gi != u32::MAX {
+                g.ccnt[gi as usize] += 1;
+            }
+        }
+        g.cstart.clear();
+        let mut run = 0u32;
+        for &c in g.ccnt.iter() {
+            g.cstart.push(run);
+            run += c;
+        }
+        g.cstart.push(run);
+        g.ccur.clear();
+        g.ccur.extend_from_slice(&g.cstart[..ng]);
+        g.sck.clear();
+        g.sck.resize(run as usize, Ck { key: 0, ts: 0, cid: 0, camp: 0 });
+        for (i, c) in ck.iter().enumerate() {
+            let gi = g.cgid[i];
+            if gi != u32::MAX {
+                let p = g.ccur[gi as usize] as usize;
+                g.sck[p] = *c;
+                g.ccur[gi as usize] += 1;
+            }
+        }
         let mut u_name = std::mem::take(&mut st.u_name);
         let mut u_day = std::mem::take(&mut st.u_day);
         let mut u_sess = std::mem::take(&mut st.u_sess);
         let mut u_ev = std::mem::take(&mut st.u_ev);
         let mut u_rev = std::mem::take(&mut st.u_rev);
         let mut u_top = std::mem::take(&mut st.u_top);
-        let mut i = 0;
-        let mut cj = 0;
-        while i < ev.len() {
-            let key = ev[i].key;
-            let mut e = i;
-            while e < ev.len() && ev[e].key == key {
-                e += 1;
-            }
-            while cj < ck.len() && ck[cj].key < key {
-                cj += 1;
-            }
-            let mut ce = cj;
-            while ce < ck.len() && ck[ce].key == key {
-                ce += 1;
-            }
-            let es = &ev[i..e];
-            let cs = &ck[cj..ce];
-            i = e;
-            cj = ce;
+        for gi in 0..ng {
+            let (a, b) = (g.start[gi] as usize, g.start[gi + 1] as usize);
+            let (ca, cb) = (g.cstart[gi] as usize, g.cstart[gi + 1] as usize);
+            sort_ts(&mut g.sev[a..b], |r: &Pe| r.ts);
+            sort_ts(&mut g.sck[ca..cb], |c: &Ck| c.ts);
+            let es = &g.sev[a..b];
+            let cs = &g.sck[ca..cb];
             let name = es[0].name;
             let (mut lo, mut hi) = (0usize, 0usize);
             let mut in_sess = false;
@@ -993,6 +1101,7 @@ fn main() {
         }
         st.ev = ev;
         st.ck = ck;
+        st.g = g;
         st.u_name = u_name;
         st.u_day = u_day;
         st.u_sess = u_sess;
