@@ -435,7 +435,9 @@ fn main() {
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |s: &str| {
         if verbose {
-            eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), s);
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            eprintln!("[{:7.3}s wall {:7.3}s cpu] {}", t0.elapsed().as_secs_f64(), ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9, s);
         }
     };
 
