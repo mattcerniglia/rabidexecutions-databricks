@@ -23,19 +23,22 @@ fn hash(b: &[u8]) -> u64 {
     const P0: u64 = 0xa076_1d64_78bd_642f;
     const P1: u64 = 0xe703_7ed1_a0b4_28db;
     const P2: u64 = 0x8ebc_6af0_9c88_c6e3;
-    let mut s = P0 ^ (b.len() as u64).wrapping_mul(P2);
-    let mut i = 0;
-    while i + 8 <= b.len() {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        s = mix(s ^ w, P1);
-        i += 8;
-    }
-    if i < b.len() {
-        let mut w = 0u64;
-        for (j, &c) in b[i..].iter().enumerate() {
-            w |= (c as u64) << (8 * j);
+    let l = b.len();
+    let mut s = P0 ^ (l as u64).wrapping_mul(P2);
+    let rd8 = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    let rd4 = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as u64;
+    if l >= 8 {
+        let mut i = 0;
+        while i + 8 < l {
+            s = mix(s ^ rd8(i), P1);
+            i += 8;
         }
-        s = mix(s ^ w ^ 0x1000, P2);
+        s = mix(s ^ rd8(l - 8), P2);
+    } else if l >= 4 {
+        s = mix(s ^ rd4(0) ^ (rd4(l - 4) << 32), P2);
+    } else if l > 0 {
+        let w = (b[0] as u64) | ((b[l / 2] as u64) << 8) | ((b[l - 1] as u64) << 16);
+        s = mix(s ^ w, P2);
     }
     let h = mix(s, P1 ^ 0x55);
     if h == 0 { 1 } else { h }
@@ -246,6 +249,126 @@ fn for_lines(d: B, mut f: impl FnMut(B)) {
     }
 }
 
+
+// ---------- fast line scanner ----------
+#[derive(Default)]
+struct Scratch {
+    cm: Vec<u32>,
+    nl: Vec<u32>,
+    qt: Vec<u32>,
+}
+#[inline(always)]
+fn push_bits(out: &mut Vec<u32>, mut m: u32, base: u32) {
+    while m != 0 {
+        out.push(base + m.trailing_zeros());
+        m &= m - 1;
+    }
+}
+fn scan(d: &[u8], sc: &mut Scratch) {
+    use std::arch::x86_64::*;
+    sc.cm.clear();
+    sc.nl.clear();
+    sc.qt.clear();
+    let n = d.len();
+    let mut i = 0usize;
+    unsafe {
+        let vc = _mm256_set1_epi8(b',' as i8);
+        let vn = _mm256_set1_epi8(b'\n' as i8);
+        let vq = _mm256_set1_epi8(b'"' as i8);
+        while i + 32 <= n {
+            let v = _mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i);
+            let mc = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vc)) as u32;
+            let mn = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vn)) as u32;
+            let mq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vq)) as u32;
+            push_bits(&mut sc.cm, mc, i as u32);
+            push_bits(&mut sc.nl, mn, i as u32);
+            push_bits(&mut sc.qt, mq, i as u32);
+            i += 32;
+        }
+    }
+    while i < n {
+        match d[i] {
+            b',' => sc.cm.push(i as u32),
+            b'\n' => sc.nl.push(i as u32),
+            b'"' => sc.qt.push(i as u32),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+/// Calls `f` with the N unquoted fields of every well-formed line of `d` (header already skipped).
+#[inline(always)]
+fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
+    let last = match memchr::memrchr(b'\n', d) {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    if last > 0 {
+        let body = &d[..last];
+        scan(body, sc);
+        let (cm, nl, qt) = (&sc.cm, &sc.nl, &sc.qt);
+        let (mut ci, mut qi, mut ls) = (0usize, 0usize, 0usize);
+        for &e in nl.iter() {
+            let e = e as usize;
+            // commas of this line
+            let ok = ci + N - 1 <= cm.len()
+                && (N == 1 || (cm[ci + N - 2] as usize) < e)
+                && (ci + N - 1 >= cm.len() || (cm[ci + N - 1] as usize) > e);
+            if ok {
+                let mut fs: [B; N] = [&d[0..0]; N];
+                let mut s = ls;
+                let mut quoted = 0usize;
+                let mut good = true;
+                for j in 0..N {
+                    let fe = if j + 1 < N { cm[ci + j] as usize } else { e };
+                    let raw = &d[s..fe];
+                    s = fe + 1;
+                    if !raw.is_empty() && raw[0] == b'"' {
+                        let l = raw.len();
+                        if l >= 2 && raw[l - 1] == b'"' {
+                            fs[j] = &raw[1..l - 1];
+                            quoted += 2;
+                        } else {
+                            good = false;
+                        }
+                    } else {
+                        fs[j] = raw;
+                    }
+                }
+                let mut qc = 0usize;
+                while qi < qt.len() && (qt[qi] as usize) < e {
+                    qi += 1;
+                    qc += 1;
+                }
+                ci += N - 1;
+                if good && qc == quoted {
+                    f(fs);
+                }
+            } else {
+                while ci < cm.len() && (cm[ci] as usize) < e {
+                    ci += 1;
+                }
+                while qi < qt.len() && (qt[qi] as usize) < e {
+                    qi += 1;
+                }
+            }
+            ls = e + 1;
+        }
+    }
+    if last < d.len() {
+        if let Some(fs) = split::<N>(&d[last..]) {
+            f(fs);
+        }
+    }
+}
+fn populate(d: &[u8]) {
+    let a = d.as_ptr() as usize & !4095;
+    let l = d.as_ptr() as usize + d.len() - a;
+    unsafe {
+        libc::madvise(a as *mut libc::c_void, l, 22); // MADV_POPULATE_READ
+    }
+}
+
 fn par<S: Send>(nt: usize, ntasks: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let ctr = AtomicUsize::new(0);
     std::thread::scope(|sc| {
@@ -300,16 +423,16 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 }
 fn build_links(files: &[B], nt: usize) -> LinkTab {
     let ch = chunks(files, 8 << 20);
-    let res = par(nt, ch.len(), Vec::<(B, B)>::new, |st, t| {
+    let res = par(nt, ch.len(), || (Scratch::default(), Vec::<(B, B)>::new()), |st, t| {
         let (fi, s, e) = ch[t];
-        for_lines(&files[fi][s..e], |l| {
-            if let Some([a, b]) = split::<2>(l) {
-                if !a.is_empty() && !b.is_empty() {
-                    st.push((a, b));
-                }
+        let (sc, out) = st;
+        lines::<2>(&files[fi][s..e], sc, |[a, b]| {
+            if !a.is_empty() && !b.is_empty() {
+                out.push((a, b));
             }
         });
     });
+    let res: Vec<Vec<(B, B)>> = res.into_iter().map(|x| x.1).collect();
     let mut idx: HM<u32> = HM::default();
     let mut names: Vec<B> = vec![];
     let mut parent: Vec<u32> = vec![];
@@ -500,10 +623,11 @@ fn main() {
 
     // clicks
     let cch = chunks(&ck_files, 4 << 20);
-    let cks: Vec<Vec<Vec<Ck>>> = par(nt, cch.len(), || (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ck>>>(), |st, t| {
+    let cks: Vec<Vec<Vec<Ck>>> = par(nt, cch.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ck>>>()), |st, t| {
         let (fi, s, e) = cch[t];
-        for_lines(&ck_files[fi][s..e], |l| {
-            let Some([cid, user, cmp, ts]) = split::<4>(l) else { return };
+        populate(&ck_files[fi][s..e]);
+        let (sc, st) = st;
+        lines::<4>(&ck_files[fi][s..e], sc, |[cid, user, cmp, ts]| {
             if cid.is_empty() || user.is_empty() {
                 return;
             }
@@ -516,15 +640,16 @@ fn main() {
             let key = links.get(uh).map_or(uh, |v| v[0]);
             st[(key >> 56) as usize].push(Ck { key, ts, cid: pack(cid), camp: c });
         });
-    });
+    }).into_iter().map(|x| x.1).collect();
     lap("clicks parsed");
 
     // events pass 1
     let ech = chunks(&ev_files, 4 << 20);
-    let evs: Vec<Vec<Vec<Ev1>>> = par(nt, ech.len(), || (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>(), |st, t| {
+    let evs: Vec<Vec<Vec<Ev1>>> = par(nt, ech.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>()), |st, t| {
         let (fi, s, e) = ech[t];
-        for_lines(&ev_files[fi][s..e], |l| {
-            let Some([id, user, ts, ing, ty, pr, price]) = split::<7>(l) else { return };
+        populate(&ev_files[fi][s..e]);
+        let (sc, st) = st;
+        lines::<7>(&ev_files[fi][s..e], sc, |[id, user, ts, ing, ty, pr, price]| {
             if id.is_empty() {
                 return;
             }
@@ -559,7 +684,7 @@ fn main() {
             let idh = hash(id);
             st[(idh >> 56) as usize].push(Ev1 { id: idh, user: hash(user), ts: tsx, ing, uptr: pack(user), price: pv, cat, kind, valid });
         });
-    });
+    }).into_iter().map(|x| x.1).collect();
     lap("events parsed");
 
     // pass 2: dedup, validate, person-map, scatter by person
