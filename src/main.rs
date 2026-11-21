@@ -961,6 +961,8 @@ fn main() {
         pq::Spec { name: "top_category", kind: pq::Kind::Str, optional: true },
     ];
     let ncat = catnames.len();
+    // persons with clicks x events above this use the interval-sweep assist path (SS_SWEEP_MIN=0 forces it, for testing)
+    let sweep_min: usize = std::env::var("SS_SWEEP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     // heaviest partitions first (whales), so no big task is left for the tail
     let mut order3: Vec<usize> = (0..NP).collect();
     order3.sort_by_key(|&p| std::cmp::Reverse(pes.iter().map(|t| t[p].len()).sum::<usize>() + cks.iter().map(|t| t[p].len()).sum::<usize>()));
@@ -1101,7 +1103,7 @@ fn main() {
             let mut s_purch = false;
             // Heavy persons (many clicks and sessions): compute assists by interval sweep afterwards
             // instead of walking every active campaign for every session.
-            let sweep = cs.len() >= 128 && es.len() >= 256;
+            let sweep = !cs.is_empty() && cs.len() * es.len() >= sweep_min;
             let mut sw_start: Vec<i64> = Vec::new();
             let mut sw_day: Vec<u32> = Vec::new();
             macro_rules! flush {
