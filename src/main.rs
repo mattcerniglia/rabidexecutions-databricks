@@ -551,6 +551,31 @@ fn write_file(dir: &Path, name: &str, bytes: Vec<u8>) {
     std::fs::write(dir.join(name), bytes).expect("write");
 }
 
+/// Adds one assist to every session (grouped by day) whose start lies in [a, b].
+#[allow(clippy::too_many_arguments)]
+fn add_interval(acc: &mut [[u64; 4]], nd: usize, sw_start: &[i64], sw_day: &[u32], day_first: &[u32], c: usize, a: i64, b: i64) {
+    let lo_i = sw_start.partition_point(|&s| s < a);
+    let hi_i = sw_start.partition_point(|&s| s <= b);
+    if lo_i >= hi_i {
+        return;
+    }
+    let (d0, d1) = (sw_day[lo_i] as usize, sw_day[hi_i - 1] as usize);
+    for d in d0..=d1 {
+        let l = lo_i.max(day_first[d] as usize);
+        let h = hi_i.min(day_first[d + 1] as usize);
+        if h > l {
+            acc[c * nd + d][3] += (h - l) as u64;
+        }
+    }
+}
+struct WhaleTimer(Option<Instant>, usize, usize);
+impl Drop for WhaleTimer {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            eprintln!("whale: {} events {} clicks -> {:.1} ms", self.1, self.2, t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
 struct S2 {
     out: Vec<Vec<Pe>>,
     v: Vec<Ev1>,
@@ -1009,6 +1034,7 @@ fn main() {
             sort_ts(&mut g.sck[ca..cb], |c: &Ck| c.ts);
             let es = &g.sev[a..b];
             let cs = &g.sck[ca..cb];
+            let _t_person = WhaleTimer(if es.len() > 3000 && std::env::var("SS_WHALE").is_ok() { Some(Instant::now()) } else { None }, es.len(), cs.len());
             let name = es[0].name;
             let (mut lo, mut hi) = (0usize, 0usize);
             let mut in_sess = false;
@@ -1019,6 +1045,11 @@ fn main() {
             let mut s_camp = 0usize;
             let mut s_d = 0usize;
             let mut s_purch = false;
+            // Heavy persons (many clicks and sessions): compute assists by interval sweep afterwards
+            // instead of walking every active campaign for every session.
+            let sweep = cs.len() >= 128 && es.len() >= 256;
+            let mut sw_start: Vec<i64> = Vec::new();
+            let mut sw_day: Vec<u32> = Vec::new();
             macro_rules! flush {
                 () => {
                     if cur_day != i64::MIN {
@@ -1055,23 +1086,27 @@ fn main() {
                     }
                     ud_s += 1;
                     while hi < cs.len() && cs[hi].ts <= start {
-                        let c = cs[hi].camp as usize;
-                        if st.cnt[c] == 0 {
-                            st.pos[c] = st.active.len() as u32;
-                            st.active.push(c as u32);
+                        if !sweep {
+                            let c = cs[hi].camp as usize;
+                            if st.cnt[c] == 0 {
+                                st.pos[c] = st.active.len() as u32;
+                                st.active.push(c as u32);
+                            }
+                            st.cnt[c] += 1;
                         }
-                        st.cnt[c] += 1;
                         hi += 1;
                     }
                     while lo < hi && cs[lo].ts < start - WEEK {
-                        let c = cs[lo].camp as usize;
-                        st.cnt[c] -= 1;
-                        if st.cnt[c] == 0 {
-                            let pi = st.pos[c] as usize;
-                            let lastc = *st.active.last().unwrap();
-                            st.active.swap_remove(pi);
-                            if pi < st.active.len() {
-                                st.pos[lastc as usize] = pi as u32;
+                        if !sweep {
+                            let c = cs[lo].camp as usize;
+                            st.cnt[c] -= 1;
+                            if st.cnt[c] == 0 {
+                                let pi = st.pos[c] as usize;
+                                let lastc = *st.active.last().unwrap();
+                                st.active.swap_remove(pi);
+                                if pi < st.active.len() {
+                                    st.pos[lastc as usize] = pi as u32;
+                                }
                             }
                         }
                         lo += 1;
@@ -1093,8 +1128,13 @@ fn main() {
                         }
                         s_camp = cs[best].camp as usize;
                     }
-                    for &c in &st.active {
-                        st.acc[c as usize * nd + s_d][3] += 1;
+                    if sweep {
+                        sw_start.push(start);
+                        sw_day.push(s_d as u32);
+                    } else {
+                        for &c in &st.active {
+                            st.acc[c as usize * nd + s_d][3] += 1;
+                        }
                     }
                     st.acc[s_camp * nd + s_d][0] += 1;
                     in_sess = true;
@@ -1115,15 +1155,50 @@ fn main() {
                 }
             }
             flush!();
-            for j in lo..hi {
-                let c = cs[j].camp as usize;
-                st.cnt[c] -= 1;
-                if st.cnt[c] == 0 {
-                    let pi = st.pos[c] as usize;
-                    let lastc = *st.active.last().unwrap();
-                    st.active.swap_remove(pi);
-                    if pi < st.active.len() {
-                        st.pos[lastc as usize] = pi as u32;
+            if sweep {
+                let ns = sw_start.len();
+                let mut day_first = vec![ns as u32; nd + 1];
+                let mut d_next = 0usize;
+                for (i, &d) in sw_day.iter().enumerate() {
+                    while d_next <= d as usize {
+                        day_first[d_next] = i as u32;
+                        d_next += 1;
+                    }
+                }
+                let mut pairs: Vec<(u32, i64)> = cs.iter().map(|c| (c.camp, c.ts)).collect();
+                pairs.sort_unstable();
+                let mut k = 0;
+                while k < pairs.len() {
+                    let c = pairs[k].0 as usize;
+                    let (mut a, mut b) = (pairs[k].1, pairs[k].1 + WEEK);
+                    let mut j = k + 1;
+                    loop {
+                        let at_end = j >= pairs.len() || pairs[j].0 as usize != c;
+                        if at_end || pairs[j].1 > b {
+                            add_interval(&mut st.acc, nd, &sw_start, &sw_day, &day_first, c, a, b);
+                            if at_end {
+                                break;
+                            }
+                            a = pairs[j].1;
+                            b = a + WEEK;
+                        } else {
+                            b = pairs[j].1 + WEEK;
+                        }
+                        j += 1;
+                    }
+                    k = j;
+                }
+            } else {
+                for j in lo..hi {
+                    let c = cs[j].camp as usize;
+                    st.cnt[c] -= 1;
+                    if st.cnt[c] == 0 {
+                        let pi = st.pos[c] as usize;
+                        let lastc = *st.active.last().unwrap();
+                        st.active.swap_remove(pi);
+                        if pi < st.active.len() {
+                            st.pos[lastc as usize] = pi as u32;
+                        }
                     }
                 }
             }
