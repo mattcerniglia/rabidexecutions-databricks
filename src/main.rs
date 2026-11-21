@@ -111,31 +111,71 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
 }
+/// "YYYY-MM-DD" (first 10 bytes of `f`) -> days since the epoch, None if not a valid calendar date.
+fn parse_date(f: &[u8]) -> Option<i64> {
+    if f.len() < 10 || f[4] != b'-' || f[7] != b'-' {
+        return None;
+    }
+    let y = d2(&f[0..2])? * 100 + d2(&f[2..4])?;
+    let mo = d2(&f[5..7])?;
+    let d = d2(&f[8..10])?;
+    if !(1..=12).contains(&mo) || d < 1 {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        2 => if leap { 29 } else { 28 },
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+/// Small direct-mapped cache: validated date text -> days. A window has few distinct dates.
+struct DateCache {
+    k1: [u64; 64],
+    k2: [u16; 64],
+    days: [i32; 64],
+}
+impl DateCache {
+    fn new() -> Self {
+        DateCache { k1: [0; 64], k2: [0; 64], days: [i32::MIN; 64] }
+    }
+    #[inline(always)]
+    fn get(&mut self, f: &[u8]) -> Option<i64> {
+        let a = u64::from_le_bytes(f[0..8].try_into().unwrap());
+        let b = u16::from_le_bytes(f[8..10].try_into().unwrap());
+        let h = ((a ^ (b as u64).wrapping_mul(0xff51_afd7_ed55_8ccd)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+        if self.k1[h] == a && self.k2[h] == b && self.days[h] != i32::MIN {
+            return Some(self.days[h] as i64);
+        }
+        let d = parse_date(f)?;
+        self.k1[h] = a;
+        self.k2[h] = b;
+        self.days[h] = d as i32;
+        Some(d)
+    }
+}
 fn parse_ts(f: &[u8]) -> Option<i64> {
+    parse_ts_c(f, &mut DateCache::new())
+}
+#[inline(always)]
+fn parse_ts_c(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     let l = f.len();
     if (l == 20 && f[19] == b'Z') || (l == 25 && (f[19] == b'+' || f[19] == b'-')) {
-        let y = d2(&f[0..2])? * 100 + d2(&f[2..4])?;
-        if f[4] != b'-' || f[7] != b'-' || f[10] != b'T' || f[13] != b':' || f[16] != b':' {
+        if f[10] != b'T' || f[13] != b':' || f[16] != b':' {
             return None;
         }
-        let mo = d2(&f[5..7])?;
-        let d = d2(&f[8..10])?;
+        let days = dc.get(f)?;
         let hh = d2(&f[11..13])?;
         let mi = d2(&f[14..16])?;
         let ss = d2(&f[17..19])?;
-        if !(1..=12).contains(&mo) || d < 1 || hh > 23 || mi > 59 || ss > 59 {
+        if hh > 23 || mi > 59 || ss > 59 {
             return None;
         }
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let dim = match mo {
-            2 => if leap { 29 } else { 28 },
-            4 | 6 | 9 | 11 => 30,
-            _ => 31,
-        };
-        if d > dim {
-            return None;
-        }
-        let mut t = (days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss) * 1000;
+        let mut t = (days * 86400 + hh * 3600 + mi * 60 + ss) * 1000;
         if l == 25 {
             if f[22] != b':' {
                 return None;
@@ -566,6 +606,80 @@ impl Small {
     }
 }
 
+#[inline(always)]
+fn make_ev(f: [B; 7], ws: i64, we: i64, products: &Small, pcat: &[u8], unknown_cat: u8, dc: &mut DateCache) -> Option<Ev1> {
+    let [id, user, ts, ing, ty, pr, price] = f;
+    if id.is_empty() {
+        return None;
+    }
+    let ing = parse_ts_c(ing, dc).unwrap_or(i64::MAX);
+    let tsv = parse_ts_c(ts, dc);
+    let mut valid = false;
+    let mut kind = 0u8;
+    let mut cat = 0u8;
+    let mut pv = 0u32;
+    let mut tsx = 0;
+    if let Some(t) = tsv {
+        tsx = t;
+        if t >= ws && t < we && !user.is_empty() && !pr.is_empty() && ing != i64::MAX && ing - t <= DAY {
+            match ty {
+                b"view" => valid = true,
+                b"cart" => {
+                    kind = 1;
+                    valid = true
+                }
+                b"purchase" => {
+                    kind = 2;
+                    if let Some(p) = parse_price(price) {
+                        pv = p;
+                        valid = true;
+                        cat = products.get(pr).map_or(unknown_cat, |i| pcat[i as usize]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(Ev1 { id: hash(id), user: hash(user), ts: tsx, ing, uptr: pack(user), price: pv, cat, kind, valid })
+}
+
+/// Append-only list stored as fixed-size blocks: no reallocation or copying as it grows.
+struct Blocks<T> {
+    full: Vec<Vec<T>>,
+    cur: Vec<T>,
+    blk: usize,
+}
+impl<T> Blocks<T> {
+    fn new(blk: usize) -> Self {
+        Blocks { full: Vec::new(), cur: Vec::new(), blk }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T) {
+        if self.cur.len() == self.cur.capacity() {
+            self.roll();
+        }
+        self.cur.push(v);
+    }
+    #[cold]
+    fn roll(&mut self) {
+        let old = std::mem::replace(&mut self.cur, Vec::with_capacity(self.blk));
+        if !old.is_empty() {
+            self.full.push(old);
+        }
+    }
+    fn len(&self) -> usize {
+        self.full.iter().map(|b| b.len()).sum::<usize>() + self.cur.len()
+    }
+    fn slices(&self) -> impl Iterator<Item = &[T]> {
+        self.full.iter().map(|b| &b[..]).chain(std::iter::once(&self.cur[..]))
+    }
+}
+fn new_blocks<T>(blk: usize) -> Vec<Blocks<T>> {
+    (0..NP).map(|_| Blocks::new(blk)).collect()
+}
+const EV_BLK: usize = 2048; // 48 B records -> 96 KB blocks
+const PE_BLK: usize = 3072; // 32 B records -> 96 KB blocks
+
 fn json_str(j: &str, key: &str) -> String {
     let i = j.find(&format!("\"{}\"", key)).expect("manifest key");
     let r = &j[i + key.len() + 2..];
@@ -622,7 +736,7 @@ impl Drop for WhaleTimer {
     }
 }
 struct S2 {
-    out: Vec<Vec<Pe>>,
+    out: Vec<Blocks<Pe>>,
     v: Vec<Ev1>,
     tab: Vec<u64>,
     surv: Vec<u32>,
@@ -774,6 +888,10 @@ fn main() {
     if let Ok(mode) = std::env::var("SS_MODE") {
         let ech = chunks(&ev_files, 2 << 20);
         let mut sc = Scratch::default();
+        let mut dc = DateCache::new();
+        let mut bufs: Vec<Blocks<Ev1>> = new_blocks(EV_BLK);
+        let mut one: Vec<Ev1> = Vec::with_capacity(2_300_000);
+        let mut bufs2: Vec<Vec<Ev1>> = (0..NP).map(|_| Vec::with_capacity(20_000)).collect();
         let t = Instant::now();
         let mut cnt = 0u64;
         let mut chk = 0u64;
@@ -805,6 +923,44 @@ fn main() {
                     cnt += 1;
                     chk += parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64;
                 }),
+                "p1np" => lines::<7>(d, &mut sc, |f| {
+                    if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                        cnt += 1;
+                        chk += ev.id ^ ev.user ^ ev.ts as u64;
+                    }
+                }),
+                "p1one" => lines::<7>(d, &mut sc, |f| {
+                    if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                        cnt += 1;
+                        one.push(ev);
+                    }
+                }),
+                "p1cap" => {
+                    lines::<7>(d, &mut sc, |f| {
+                        if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                            cnt += 1;
+                            bufs[(ev.id >> 56) as usize].push(ev);
+                        }
+                    })
+                }
+                "p1twice" => {
+                    // second pass reuses already-faulted memory: pure push cost
+                    for b in bufs2.iter_mut() {
+                        b.clear();
+                    }
+                    lines::<7>(d, &mut sc, |f| {
+                        if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                            cnt += 1;
+                            bufs2[(ev.id >> 56) as usize].push(ev);
+                        }
+                    })
+                }
+                "p1" => lines::<7>(d, &mut sc, |f| {
+                    if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                        cnt += 1;
+                        bufs[(ev.id >> 56) as usize].push(ev);
+                    }
+                }),
                 _ => {}
             }
         }
@@ -814,44 +970,15 @@ fn main() {
 
 
     let ech = chunks(&ev_files, 2 << 20);
-    let ev_run = || -> Vec<Vec<Vec<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ev1>>>()), |st, t| {
+    let ev_run = || -> Vec<Vec<Blocks<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), new_blocks::<Ev1>(EV_BLK)), |st, t| {
         let (fi, s, e) = ech[t];
         populate(&ev_files[fi][s..e]);
         let (sc, st) = st;
-        lines::<7>(&ev_files[fi][s..e], sc, |[id, user, ts, ing, ty, pr, price]| {
-            if id.is_empty() {
-                return;
+        let mut dc = DateCache::new();
+        lines::<7>(&ev_files[fi][s..e], sc, |f| {
+            if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
+                st[(ev.id >> 56) as usize].push(ev);
             }
-            let ing = parse_ts(ing).unwrap_or(i64::MAX);
-            let tsv = parse_ts(ts);
-            let mut valid = false;
-            let mut kind = 0u8;
-            let mut cat = 0u8;
-            let mut pv = 0u32;
-            let mut tsx = 0;
-            if let Some(t) = tsv {
-                tsx = t;
-                if t >= ws && t < we && !user.is_empty() && !pr.is_empty() && ing != i64::MAX && ing - t <= DAY {
-                    match ty {
-                        b"view" => valid = true,
-                        b"cart" => {
-                            kind = 1;
-                            valid = true
-                        }
-                        b"purchase" => {
-                            kind = 2;
-                            if let Some(p) = parse_price(price) {
-                                pv = p;
-                                valid = true;
-                                cat = products.get(pr).map_or(unknown_cat, |i| pcat[i as usize]);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let idh = hash(id);
-            st[(idh >> 56) as usize].push(Ev1 { id: idh, user: hash(user), ts: tsx, ing, uptr: pack(user), price: pv, cat, kind, valid });
         });
     }).into_iter().map(|x| x.1).collect() };
     let (links, evs) = std::thread::scope(|s| {
@@ -863,15 +990,16 @@ fn main() {
 
     // clicks
     let cch = chunks(&ck_files, 4 << 20);
-    let cks: Vec<Vec<Vec<Ck>>> = par(nt, cch.len(), || (Scratch::default(), (0..NP).map(|_| Vec::new()).collect::<Vec<Vec<Ck>>>()), |st, t| {
+    let cks: Vec<Vec<Blocks<Ck>>> = par(nt, cch.len(), || (Scratch::default(), new_blocks::<Ck>(PE_BLK)), |st, t| {
         let (fi, s, e) = cch[t];
         populate(&ck_files[fi][s..e]);
         let (sc, st) = st;
+        let mut dc = DateCache::new();
         lines::<4>(&ck_files[fi][s..e], sc, |[cid, user, cmp, ts]| {
             if cid.is_empty() || user.is_empty() {
                 return;
             }
-            let Some(ts) = parse_ts(ts) else { return };
+            let Some(ts) = parse_ts_c(ts, &mut dc) else { return };
             if ts < ws - WEEK || ts >= we {
                 return;
             }
@@ -885,13 +1013,15 @@ fn main() {
 
 
     // pass 2: dedup, validate, person-map, scatter by person
-    let pes: Vec<Vec<Vec<Pe>>> = par(nt, NP, || S2 { out: (0..NP).map(|_| Vec::new()).collect(), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
+    let pes: Vec<Vec<Blocks<Pe>>> = par(nt, NP, || S2 { out: new_blocks::<Pe>(PE_BLK), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
         let S2 { out: st, v, tab, surv } = s2;
         let n: usize = evs.iter().map(|t| t[p].len()).sum();
         v.clear();
         v.reserve(n);
         for t in &evs {
-            v.extend_from_slice(&t[p]);
+            for s in t[p].slices() {
+                v.extend_from_slice(s);
+            }
         }
         let cap = (v.len() * 2 + 2).next_power_of_two();
         let mask = cap - 1;
@@ -977,13 +1107,17 @@ fn main() {
         ev.clear();
         ev.reserve(pes.iter().map(|t| t[p].len()).sum());
         for t in &pes {
-            ev.extend_from_slice(&t[p]);
+            for s in t[p].slices() {
+                ev.extend_from_slice(s);
+            }
         }
         let mut ck = std::mem::take(&mut st.ck);
         ck.clear();
         ck.reserve(cks.iter().map(|t| t[p].len()).sum());
         for t in &cks {
-            ck.extend_from_slice(&t[p]);
+            for s in t[p].slices() {
+                ck.extend_from_slice(s);
+            }
         }
         let tp0 = Instant::now();
         let mut g = std::mem::take(&mut st.g);
@@ -1341,4 +1475,80 @@ fn main() {
     write_file(&outd.join("campaign_daily"), "part-0.parquet", pq::file_bytes(&specs, &pages, n));
     lap("done");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T: i64 = 1_791_071_890_000; // 2026-10-03T23:58:10Z
+
+    #[test]
+    fn timestamp_forms() {
+        assert_eq!(parse_ts(b"2026-10-03T23:58:10Z"), Some(T));
+        assert_eq!(parse_ts(b"2026-10-03T19:58:10-04:00"), Some(T));
+        assert_eq!(parse_ts(b"2026-10-04T05:58:10+06:00"), Some(T));
+        assert_eq!(parse_ts(b"2026-10-03T23:58:10-00:00"), Some(T));
+        assert_eq!(parse_ts(b"1791071890000"), Some(T));
+        assert_eq!(parse_ts(b"0001791071890000"), Some(T));
+        assert_eq!(parse_ts(b"86400000"), Some(86_400_000));
+    }
+
+    #[test]
+    fn timestamp_rejects() {
+        for bad in [
+            &b""[..],
+            b"2026-10-03T23:58:10.5Z",
+            b"2026-10-03t23:58:10Z",
+            b"2026-10-03 23:58:10Z",
+            b"2026-10-03T23:58:10",
+            b"2026-13-03T23:58:10Z",
+            b"2026-02-30T23:58:10Z",
+            b"2027-02-29T23:58:10Z",
+            b"2026-10-03T24:00:00Z",
+            b"2026-10-03T23:58:60Z",
+            b"2026-10-03T23:58:10+24:00",
+            b"2026-10-03T23:58:10+05:60",
+            b"2026-10-03T23:58:10+0200",
+            b"1791071890000.0",
+            b"1.79e12",
+            b"-5",
+            b"99999999999999999999999",
+        ] {
+            assert_eq!(parse_ts(bad), None, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(parse_ts(b"2028-02-29T00:00:00Z"), Some(1_835_395_200_000));
+    }
+
+    #[test]
+    fn date_cache_matches_uncached() {
+        let mut dc = DateCache::new();
+        for _ in 0..3 {
+            assert_eq!(parse_ts_c(b"2026-10-03T23:58:10Z", &mut dc), Some(T));
+            assert_eq!(parse_ts_c(b"2026-10-04T05:58:10+06:00", &mut dc), Some(T));
+            assert_eq!(parse_ts_c(b"2026-02-30T00:00:00Z", &mut dc), None);
+        }
+    }
+
+    #[test]
+    fn csv_lines_and_quotes() {
+        let d: B = b"a,b\n1,\"x\"\n\"1\",\"\"\n1,2,3\n\n\"u,2\n1,\"a\"b\n3,4\n5,6";
+        let mut sc = Scratch::default();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = vec![];
+        // header already skipped by callers; here the first line "a,b" is just data
+        lines::<2>(d, &mut sc, |[x, y]| got.push((x.to_vec(), y.to_vec())));
+        let want: Vec<(&[u8], &[u8])> = vec![(b"a", b"b"), (b"1", b"x"), (b"1", b""), (b"3", b"4"), (b"5", b"6")];
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!((&g.0[..], &g.1[..]), w);
+        }
+    }
+
+    #[test]
+    fn hash_is_nonzero_and_distinguishes() {
+        assert_ne!(hash(b""), 0);
+        assert_ne!(hash(b"u1"), hash(b"U1"));
+        assert_ne!(hash(b"u1"), hash(b"u1 "));
+        assert_eq!(hash(b"abcdefghij"), hash(b"abcdefghij"));
+    }
 }
