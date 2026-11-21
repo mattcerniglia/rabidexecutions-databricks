@@ -377,24 +377,51 @@ fn populate(d: &[u8]) {
 
 fn par<S: Send>(nt: usize, ntasks: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
     let ctr = AtomicUsize::new(0);
-    std::thread::scope(|sc| {
+    let prof = std::env::var("SS_TASKS").is_ok();
+    let t_start = Instant::now();
+    let durs: std::sync::Mutex<Vec<(f64, usize)>> = std::sync::Mutex::new(Vec::new());
+    let res = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 sc.spawn(|| {
                     let mut s = init();
+                    let mut mine: Vec<(f64, usize)> = Vec::new();
                     loop {
                         let t = ctr.fetch_add(1, Ordering::Relaxed);
                         if t >= ntasks {
                             break;
                         }
-                        f(&mut s, t);
+                        if prof {
+                            let t0 = Instant::now();
+                            f(&mut s, t);
+                            mine.push((t0.elapsed().as_secs_f64(), t));
+                        } else {
+                            f(&mut s, t);
+                        }
+                    }
+                    if prof {
+                        durs.lock().unwrap().extend(mine);
                     }
                     s
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    });
+    if prof {
+        let mut d = durs.into_inner().unwrap();
+        d.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let sum: f64 = d.iter().map(|x| x.0).sum();
+        eprintln!(
+            "  par: {} tasks, wall {:.3}s, sum {:.3}s (ideal {:.3}s), top tasks: {}",
+            ntasks,
+            t_start.elapsed().as_secs_f64(),
+            sum,
+            sum / nt as f64,
+            d.iter().take(3).map(|x| format!("#{}={:.0}ms", x.1, x.0 * 1e3)).collect::<Vec<_>>().join(" ")
+        );
+    }
+    res
 }
 
 // ---------- link table ----------
@@ -567,6 +594,24 @@ fn add_interval(acc: &mut [[u64; 4]], nd: usize, sw_start: &[i64], sw_day: &[u32
             acc[c * nd + d][3] += (h - l) as u64;
         }
     }
+}
+static FILE_ID: AtomicUsize = AtomicUsize::new(0);
+const FLUSH_ROWS: usize = 49_152;
+
+#[allow(clippy::too_many_arguments)]
+fn flush_users(dir: &Path, specs: &[pq::Spec], cats: &[B], name: &[u64], day: &[i32], sess: &[i32], ev: &[i32], rev: &[i64], top: &[u8]) {
+    let n = name.len();
+    let tops: Vec<Option<B>> = top.iter().map(|&t| if t == 255 { None } else { Some(cats[t as usize]) }).collect();
+    let pages = [
+        pq::str_page(name.iter().map(|&p| unpack(p)), n),
+        pq::i32_page(day),
+        pq::i32_page(sess),
+        pq::i32_page(ev),
+        pq::i64_page(rev),
+        pq::opt_str_page(&tops),
+    ];
+    let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
+    write_file(dir, &format!("part-{:05}.parquet", id), pq::file_bytes(specs, &pages, n));
 }
 struct WhaleTimer(Option<Instant>, usize, usize);
 impl Drop for WhaleTimer {
@@ -1203,6 +1248,15 @@ fn main() {
                 }
             }
         }
+        if u_name.len() >= FLUSH_ROWS {
+            flush_users(&udir, &ud_specs, &catnames, &u_name, &u_day, &u_sess, &u_ev, &u_rev, &u_top);
+            u_name.clear();
+            u_day.clear();
+            u_sess.clear();
+            u_ev.clear();
+            u_rev.clear();
+            u_top.clear();
+        }
         st.ev = ev;
         st.ck = ck;
         st.g = g;
@@ -1213,24 +1267,16 @@ fn main() {
         st.u_rev = u_rev;
         st.u_top = u_top;
     });
-    // one parquet file per worker state, written in parallel
+    // leftover rows of each worker state (< FLUSH_ROWS each), written in parallel
     par(nt, p3s.len(), || (), |_, t| {
         let s = &p3s[t];
-        let n = s.u_name.len();
-        if n == 0 && t != 0 {
-            return;
+        if !s.u_name.is_empty() {
+            flush_users(&udir, &ud_specs, &catnames, &s.u_name, &s.u_day, &s.u_sess, &s.u_ev, &s.u_rev, &s.u_top);
         }
-        let tops: Vec<Option<B>> = s.u_top.iter().map(|&t| if t == 255 { None } else { Some(catnames[t as usize]) }).collect();
-        let pages = [
-            pq::str_page(s.u_name.iter().map(|&p| unpack(p)), n),
-            pq::i32_page(&s.u_day),
-            pq::i32_page(&s.u_sess),
-            pq::i32_page(&s.u_ev),
-            pq::i64_page(&s.u_rev),
-            pq::opt_str_page(&tops),
-        ];
-        write_file(&udir, &format!("part-{:03}.parquet", t), pq::file_bytes(&ud_specs, &pages, n));
     });
+    if FILE_ID.load(Ordering::Relaxed) == 0 {
+        flush_users(&udir, &ud_specs, &catnames, &[], &[], &[], &[], &[], &[]);
+    }
     lap("sessions + user_daily");
 
     // campaign_daily
