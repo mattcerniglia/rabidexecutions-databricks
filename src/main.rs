@@ -255,7 +255,8 @@ fn for_lines(d: B, mut f: impl FnMut(B)) {
 struct Scratch {
     cm: Vec<u32>,
     nl: Vec<u32>,
-    qt: Vec<u32>,
+    /// cumulative count of '"' bytes before each newline
+    nq: Vec<u32>,
 }
 #[inline(always)]
 fn push_bits(out: &mut Vec<u32>, mut m: u32, base: u32) {
@@ -268,9 +269,12 @@ fn scan(d: &[u8], sc: &mut Scratch) {
     use std::arch::x86_64::*;
     sc.cm.clear();
     sc.nl.clear();
-    sc.qt.clear();
+    sc.nq.clear();
     let n = d.len();
     let mut i = 0usize;
+    let mut qrun = 0u32;
+    // SAFETY: AVX2 is enabled for the whole crate via target-cpu=x86-64-v3 (.cargo/config.toml);
+    // every 32-byte load is at offset i with i + 32 <= n, so it stays inside `d`.
     unsafe {
         let vc = _mm256_set1_epi8(b',' as i8);
         let vn = _mm256_set1_epi8(b'\n' as i8);
@@ -278,19 +282,27 @@ fn scan(d: &[u8], sc: &mut Scratch) {
         while i + 32 <= n {
             let v = _mm256_loadu_si256(d.as_ptr().add(i) as *const __m256i);
             let mc = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vc)) as u32;
-            let mn = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vn)) as u32;
+            let mut mn = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vn)) as u32;
             let mq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vq)) as u32;
             push_bits(&mut sc.cm, mc, i as u32);
-            push_bits(&mut sc.nl, mn, i as u32);
-            push_bits(&mut sc.qt, mq, i as u32);
+            while mn != 0 {
+                let k = mn.trailing_zeros();
+                sc.nl.push(i as u32 + k);
+                sc.nq.push(qrun + (mq & ((1u32 << k) - 1)).count_ones());
+                mn &= mn - 1;
+            }
+            qrun += mq.count_ones();
             i += 32;
         }
     }
     while i < n {
         match d[i] {
             b',' => sc.cm.push(i as u32),
-            b'\n' => sc.nl.push(i as u32),
-            b'"' => sc.qt.push(i as u32),
+            b'\n' => {
+                sc.nl.push(i as u32);
+                sc.nq.push(qrun);
+            }
+            b'"' => qrun += 1,
             _ => {}
         }
         i += 1;
@@ -306,10 +318,12 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
     if last > 0 {
         let body = &d[..last];
         scan(body, sc);
-        let (cm, nl, qt) = (&sc.cm, &sc.nl, &sc.qt);
-        let (mut ci, mut qi, mut ls) = (0usize, 0usize, 0usize);
-        for &e in nl.iter() {
+        let (cm, nl, nq) = (&sc.cm, &sc.nl, &sc.nq);
+        let (mut ci, mut ls, mut pq_) = (0usize, 0usize, 0u32);
+        for (li, &e) in nl.iter().enumerate() {
             let e = e as usize;
+            let qc = (nq[li] - pq_) as usize;
+            pq_ = nq[li];
             // commas of this line
             let ok = ci + N - 1 <= cm.len()
                 && (N == 1 || (cm[ci + N - 2] as usize) < e)
@@ -335,11 +349,6 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
                         fs[j] = raw;
                     }
                 }
-                let mut qc = 0usize;
-                while qi < qt.len() && (qt[qi] as usize) < e {
-                    qi += 1;
-                    qc += 1;
-                }
                 ci += N - 1;
                 if good && qc == quoted {
                     f(fs);
@@ -347,9 +356,6 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
             } else {
                 while ci < cm.len() && (cm[ci] as usize) < e {
                     ci += 1;
-                }
-                while qi < qt.len() && (qt[qi] as usize) < e {
-                    qi += 1;
                 }
             }
             ls = e + 1;
