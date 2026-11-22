@@ -114,7 +114,7 @@ pub fn i64_page(v: &[i64]) -> Page {
 /// optional string page: `vals[i] == None` is null.
 pub fn opt_str_page(vals: &[Option<&'static [u8]>]) -> Page {
     let n = vals.len();
-    let groups = (n + 7) / 8;
+    let groups = n.div_ceil(8);
     let mut rle = Vec::new();
     varint(&mut rle, ((groups as u64) << 1) | 1);
     let base = rle.len();
@@ -135,7 +135,8 @@ pub fn opt_str_page(vals: &[Option<&'static [u8]>]) -> Page {
 }
 
 pub fn file_bytes(specs: &[Spec], pages: &[Page], nrows: usize) -> Vec<u8> {
-    let mut out: Vec<u8> = b"PAR1".to_vec();
+    let mut out: Vec<u8> = Vec::with_capacity(pages.iter().map(|p| p.data.len() + 64).sum::<usize>() + 4096);
+    out.extend_from_slice(b"PAR1");
     let mut chunks = Vec::new(); // (offset, size, nvals)
     for p in pages {
         let off = out.len();
