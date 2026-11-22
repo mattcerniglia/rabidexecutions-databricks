@@ -377,16 +377,38 @@ fn scan(d: &[u8], sc: &mut Scratch) {
     }
 }
 /// Calls `f` with the N unquoted fields of every well-formed line of `d` (header already skipped).
+/// Works in L1-sized sub-blocks: each block is scanned and then parsed while its bytes and position lists are still hot.
 #[inline(always)]
-#[allow(clippy::needless_range_loop)] // indexed on purpose: unchecked accesses below mirror the checks above
 fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
+    const SUB: usize = 32 * 1024;
     let last = match memchr::memrchr(b'\n', d) {
         Some(i) => i + 1,
         None => 0,
     };
+    let mut pos = 0usize;
+    while pos < last {
+        let mut end = (pos + SUB).min(last);
+        if end < last {
+            end = match memchr::memchr(b'\n', &d[end..last]) {
+                Some(i) => end + i + 1,
+                None => last,
+            };
+        }
+        lines_block::<N, _>(&d[pos..end], sc, &mut f);
+        pos = end;
+    }
+    if last < d.len() {
+        if let Some(fs) = split::<N>(&d[last..]) {
+            f(fs);
+        }
+    }
+}
+#[allow(clippy::needless_range_loop)] // indexed on purpose: unchecked accesses below mirror the checks above
+/// `d` must end with a newline (or be empty); every line in it is complete.
+fn lines_block<const N: usize, F: FnMut([B; N])>(d: B, sc: &mut Scratch, f: &mut F) {
+    let last = d.len();
     if last > 0 {
-        let body = &d[..last];
-        scan(body, sc);
+        scan(d, sc);
         let (cm, nl, nq) = (&sc.cm, &sc.nl, &sc.nq);
         let (mut ci, mut ls, mut pq_) = (0usize, 0usize, 0u32);
         for (li, &e) in nl.iter().enumerate() {
@@ -432,11 +454,6 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
                 }
             }
             ls = e + 1;
-        }
-    }
-    if last < d.len() {
-        if let Some(fs) = split::<N>(&d[last..]) {
-            f(fs);
         }
     }
 }
