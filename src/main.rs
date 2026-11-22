@@ -9,7 +9,8 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 604_800_000;
 const GAP: i64 = 1_800_000;
-const NP: usize = 256;
+/// Default shuffle fan-out; `main` picks the real value (power of two) from the input size, or SS_NP.
+const NP_DEFAULT: usize = 256;
 type B = &'static [u8];
 
 // ---------- hashing ----------
@@ -737,8 +738,8 @@ impl<T> Blocks<T> {
         self.full.iter().map(|b| &b[..]).chain(std::iter::once(&self.cur[..]))
     }
 }
-fn new_blocks<T>(blk: usize) -> Vec<Blocks<T>> {
-    (0..NP).map(|_| Blocks::new(blk)).collect()
+fn new_blocks<T>(np: usize, blk: usize) -> Vec<Blocks<T>> {
+    (0..np).map(|_| Blocks::new(blk)).collect()
 }
 const EV_BLK: usize = 2048; // 48 B records -> 96 KB blocks
 const PE_BLK: usize = 3072; // 32 B records -> 96 KB blocks
@@ -951,6 +952,13 @@ fn main() {
     let ck_files = load("clicks");
     let lk_files = load("links");
     lap("mapped");
+    // Shuffle fan-out. 256 is what the scorer has measured; SS_NP overrides it for experiments
+    // (a local sweep from 8 to 512 showed no cost from larger partitions, so it is not scaled with input size).
+    let np: usize = std::env::var("SS_NP").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| n.is_power_of_two() && *n >= 2 && *n <= 4096).unwrap_or(NP_DEFAULT);
+    let sh = 64 - np.trailing_zeros();
+    if verbose {
+        eprintln!("partitions: {np}");
+    }
     if std::env::var("SS_MODE").as_deref() == Ok("links") {
         let t = Instant::now();
         let lt = build_links(&lk_files, 1);
@@ -961,9 +969,9 @@ fn main() {
         let ech = chunks(&ev_files, 2 << 20);
         let mut sc = Scratch::default();
         let mut dc = DateCache::new();
-        let mut bufs: Vec<Blocks<Ev1>> = new_blocks(EV_BLK);
+        let mut bufs: Vec<Blocks<Ev1>> = new_blocks(np, EV_BLK);
         let mut one: Vec<Ev1> = Vec::with_capacity(2_300_000);
-        let mut bufs2: Vec<Vec<Ev1>> = (0..NP).map(|_| Vec::with_capacity(20_000)).collect();
+        let mut bufs2: Vec<Vec<Ev1>> = (0..np).map(|_| Vec::with_capacity(20_000)).collect();
         let t = Instant::now();
         let mut cnt = 0u64;
         let mut chk = 0u64;
@@ -1011,7 +1019,7 @@ fn main() {
                     lines::<7>(d, &mut sc, |f| {
                         if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
                             cnt += 1;
-                            bufs[(ev.id >> 56) as usize].push(ev);
+                            bufs[(ev.id >> sh) as usize].push(ev);
                         }
                     })
                 }
@@ -1023,14 +1031,14 @@ fn main() {
                     lines::<7>(d, &mut sc, |f| {
                         if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
                             cnt += 1;
-                            bufs2[(ev.id >> 56) as usize].push(ev);
+                            bufs2[(ev.id >> sh) as usize].push(ev);
                         }
                     })
                 }
                 "p1" => lines::<7>(d, &mut sc, |f| {
                     if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
                         cnt += 1;
-                        bufs[(ev.id >> 56) as usize].push(ev);
+                        bufs[(ev.id >> sh) as usize].push(ev);
                     }
                 }),
                 _ => {}
@@ -1042,14 +1050,14 @@ fn main() {
 
 
     let ech = chunks(&ev_files, 2 << 20);
-    let ev_run = || -> Vec<Vec<Blocks<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), new_blocks::<Ev1>(EV_BLK)), |st, t| {
+    let ev_run = || -> Vec<Vec<Blocks<Ev1>>> { par(nt, ech.len(), || (Scratch::default(), new_blocks::<Ev1>(np, EV_BLK)), |st, t| {
         let (fi, s, e) = ech[t];
         populate(&ev_files[fi][s..e]);
         let (sc, st) = st;
         let mut dc = DateCache::new();
         lines::<7>(&ev_files[fi][s..e], sc, |f| {
             if let Some(ev) = make_ev(f, ws, we, &products, &pcat, unknown_cat, &mut dc) {
-                st[(ev.id >> 56) as usize].push(ev);
+                st[(ev.id >> sh) as usize].push(ev);
             }
         });
     }).into_iter().map(|x| x.1).collect() };
@@ -1067,7 +1075,7 @@ fn main() {
 
     // clicks
     let cch = chunks(&ck_files, 4 << 20);
-    let cks: Vec<Vec<Blocks<Ck>>> = par(nt, cch.len(), || (Scratch::default(), new_blocks::<Ck>(PE_BLK), Vec::<(u64, i64, u64, u32)>::new()), |st, t| {
+    let cks: Vec<Vec<Blocks<Ck>>> = par(nt, cch.len(), || (Scratch::default(), new_blocks::<Ck>(np, PE_BLK), Vec::<(u64, i64, u64, u32)>::new()), |st, t| {
         let (fi, s, e) = cch[t];
         populate(&ck_files[fi][s..e]);
         let (sc, st, tmp) = st;
@@ -1092,14 +1100,14 @@ fn main() {
             }
             let (uh, ts, cid, c) = tmp[i];
             let key = links.get(uh).map_or(uh, |v| v[0]);
-            st[(key >> 56) as usize].push(Ck { key, ts, cid, camp: c });
+            st[(key >> sh) as usize].push(Ck { key, ts, cid, camp: c });
         }
     }).into_iter().map(|x| x.1).collect();
     lap("clicks parsed");
 
 
     // pass 2: dedup, validate, person-map, scatter by person
-    let pes: Vec<Vec<Blocks<Pe>>> = par(nt, NP, || S2 { out: new_blocks::<Pe>(PE_BLK), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
+    let pes: Vec<Vec<Blocks<Pe>>> = par(nt, np, || S2 { out: new_blocks::<Pe>(np, PE_BLK), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
         let S2 { out: st, v, tab, surv } = s2;
         let q0 = thread_user_ns();
         let n: usize = evs.iter().map(|t| t[p].len()).sum();
@@ -1159,7 +1167,7 @@ fn main() {
                 Some(x) => (x[0], x[1]),
                 None => (r.user, r.uptr),
             };
-            st[(key >> 56) as usize].push(Pe { key, ts: r.ts, name, price: r.price, cat: r.cat, kind: r.kind });
+            st[(key >> sh) as usize].push(Pe { key, ts: r.ts, name, price: r.price, cat: r.cat, kind: r.kind });
         }
         let q4 = thread_user_ns() - q0;
         PH[0].fetch_add(q1 as usize, Ordering::Relaxed);
@@ -1192,9 +1200,9 @@ fn main() {
     // persons with clicks x events above this use the interval-sweep assist path (SS_SWEEP_MIN=0 forces it, for testing)
     let sweep_min: usize = std::env::var("SS_SWEEP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
     // heaviest partitions first (whales), so no big task is left for the tail
-    let mut order3: Vec<usize> = (0..NP).collect();
+    let mut order3: Vec<usize> = (0..np).collect();
     order3.sort_by_key(|&p| std::cmp::Reverse(pes.iter().map(|t| t[p].len()).sum::<usize>() + cks.iter().map(|t| t[p].len()).sum::<usize>()));
-    let p3s: Vec<P3> = par(nt, NP, || P3 {
+    let p3s: Vec<P3> = par(nt, np, || P3 {
         acc: vec![[0; 4]; (ncamp + 1) * nd],
         cnt: vec![0; ncamp + 1],
         pos: vec![0; ncamp + 1],
