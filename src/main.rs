@@ -990,11 +990,12 @@ fn main() {
 
     // clicks
     let cch = chunks(&ck_files, 4 << 20);
-    let cks: Vec<Vec<Blocks<Ck>>> = par(nt, cch.len(), || (Scratch::default(), new_blocks::<Ck>(PE_BLK)), |st, t| {
+    let cks: Vec<Vec<Blocks<Ck>>> = par(nt, cch.len(), || (Scratch::default(), new_blocks::<Ck>(PE_BLK), Vec::<(u64, i64, u64, u32)>::new()), |st, t| {
         let (fi, s, e) = cch[t];
         populate(&ck_files[fi][s..e]);
-        let (sc, st) = st;
+        let (sc, st, tmp) = st;
         let mut dc = DateCache::new();
+        tmp.clear();
         lines::<4>(&ck_files[fi][s..e], sc, |[cid, user, cmp, ts]| {
             if cid.is_empty() || user.is_empty() {
                 return;
@@ -1004,10 +1005,18 @@ fn main() {
                 return;
             }
             let Some(c) = campaigns.get(cmp) else { return };
-            let uh = hash(user);
-            let key = links.get(uh).map_or(uh, |v| v[0]);
-            st[(key >> 56) as usize].push(Ck { key, ts, cid: pack(cid), camp: c });
+            tmp.push((hash(user), ts, pack(cid), c));
         });
+        // resolve person keys with lookahead prefetch (the link table is large)
+        const LA: usize = 8;
+        for i in 0..tmp.len() {
+            if i + LA < tmp.len() {
+                links.prefetch(tmp[i + LA].0);
+            }
+            let (uh, ts, cid, c) = tmp[i];
+            let key = links.get(uh).map_or(uh, |v| v[0]);
+            st[(key >> 56) as usize].push(Ck { key, ts, cid, camp: c });
+        }
     }).into_iter().map(|x| x.1).collect();
     lap("clicks parsed");
 
