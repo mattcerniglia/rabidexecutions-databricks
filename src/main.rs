@@ -513,36 +513,51 @@ fn build_links(files: &[B], nt: usize) -> LinkTab {
         });
     });
     let res: Vec<Vec<(B, B)>> = res.into_iter().map(|x| x.1).collect();
-    let mut idx: HM<u32> = HM::default();
-    let mut names: Vec<B> = vec![];
-    let mut parent: Vec<u32> = vec![];
-    let mut hs: Vec<u64> = vec![];
-    let mut intern = |s: B, idx: &mut HM<u32>| -> u32 {
-        let h = hash(s);
-        *idx.entry(h).or_insert_with(|| {
-            names.push(s);
-            parent.push(names.len() as u32 - 1);
-            hs.push(h);
-            names.len() as u32 - 1
-        })
-    };
-    let mut edges = vec![];
+    let t_parse = Instant::now();
+    // Intern every id straight into the final open-addressing table (keys = id hash), union as we go.
+    let pairs: usize = res.iter().map(|v| v.len()).sum();
+    let cap = (pairs * 3 + 2).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let mut keys = vec![0u64; cap];
+    let mut slot_id = vec![0u32; cap];
+    let mut names: Vec<B> = Vec::with_capacity(pairs * 2);
+    let mut hs: Vec<u64> = Vec::with_capacity(pairs * 2);
+    let mut slot_of: Vec<u32> = Vec::with_capacity(pairs * 2);
+    let mut parent: Vec<u32> = Vec::with_capacity(pairs * 2);
     for v in &res {
         for &(a, b) in v {
-            let x = intern(a, &mut idx);
-            let y = intern(b, &mut idx);
-            edges.push((x, y));
-        }
-    }
-    drop(intern);
-    for (x, y) in edges {
-        let rx = find(&mut parent, x);
-        let ry = find(&mut parent, y);
-        if rx != ry {
-            parent[rx.max(ry) as usize] = rx.min(ry);
+            let mut ids = [0u32; 2];
+            for (k, s) in [a, b].into_iter().enumerate() {
+                let h = hash(s);
+                let mut i = (h as usize) & mask;
+                ids[k] = loop {
+                    let kk = keys[i];
+                    if kk == h {
+                        break slot_id[i];
+                    }
+                    if kk == 0 {
+                        let id = names.len() as u32;
+                        keys[i] = h;
+                        slot_id[i] = id;
+                        names.push(s);
+                        hs.push(h);
+                        slot_of.push(i as u32);
+                        parent.push(id);
+                        break id;
+                    }
+                    i = (i + 1) & mask;
+                };
+            }
+            let rx = find(&mut parent, ids[0]);
+            let ry = find(&mut parent, ids[1]);
+            if rx != ry {
+                parent[rx.max(ry) as usize] = rx.min(ry);
+            }
         }
     }
     let n = names.len();
+    let t_intern = t_parse.elapsed();
+    // name of each person = byte-wise smallest id of its component
     let mut best: Vec<u32> = (0..n as u32).collect();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
@@ -550,19 +565,16 @@ fn build_links(files: &[B], nt: usize) -> LinkTab {
             best[r] = i as u32;
         }
     }
-    let cap = (n * 2 + 2).next_power_of_two();
-    let mut t = LinkTab { mask: cap - 1, keys: vec![0; cap], vals: vec![[0, 0]; cap] };
+    let mut vals = vec![[0u64, 0u64]; cap];
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        let nm = names[best[r] as usize];
-        let mut j = (hs[i] as usize) & t.mask;
-        while t.keys[j] != 0 {
-            j = (j + 1) & t.mask;
-        }
-        t.keys[j] = hs[i];
-        t.vals[j] = [hash(nm), pack(nm)];
+        let nm = best[r] as usize;
+        vals[slot_of[i] as usize] = [hs[nm], pack(names[nm])];
     }
-    t
+    if std::env::var("SS_MODE").is_ok() {
+        eprintln!("  links detail: pairs {} ids {} cap {}; intern+union {:.1}ms, name+table {:.1}ms", pairs, n, cap, t_intern.as_secs_f64() * 1e3, (t_parse.elapsed() - t_intern).as_secs_f64() * 1e3);
+    }
+    LinkTab { mask, keys, vals }
 }
 
 // ---------- records ----------
@@ -885,6 +897,12 @@ fn main() {
     let ck_files = load("clicks");
     let lk_files = load("links");
     lap("mapped");
+    if std::env::var("SS_MODE").as_deref() == Ok("links") {
+        let t = Instant::now();
+        let lt = build_links(&lk_files, 1);
+        eprintln!("links: {:.3}s for {} table slots", t.elapsed().as_secs_f64(), lt.keys.len());
+        return;
+    }
     if let Ok(mode) = std::env::var("SS_MODE") {
         let ech = chunks(&ev_files, 2 << 20);
         let mut sc = Scratch::default();
@@ -982,7 +1000,12 @@ fn main() {
         });
     }).into_iter().map(|x| x.1).collect() };
     let (links, evs) = std::thread::scope(|s| {
-        let h = s.spawn(|| build_links(&lk_files, 2));
+        let h = s.spawn(|| {
+            let tl = Instant::now();
+            let lt = build_links(&lk_files, 2);
+            lap(&format!("link table built ({:.3}s on its own thread)", tl.elapsed().as_secs_f64()));
+            lt
+        });
         let evs = ev_run();
         (h.join().unwrap(), evs)
     });
