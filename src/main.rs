@@ -1169,8 +1169,9 @@ fn main() {
         // iterate the block lists in place: no gather copy
         let n: usize = pes.iter().map(|t| t[p].len()).sum();
         let nck: usize = cks.iter().map(|t| t[p].len()).sum();
-        let ev_it = || pes.iter().flat_map(|t| t[p].slices()).flat_map(|s| s.iter());
-        let ck_it = || cks.iter().flat_map(|t| t[p].slices()).flat_map(|s| s.iter());
+        // plain slice lists (a few hundred entries): the per-record loops below stay simple nested slice loops
+        let ev_sl: Vec<&[Pe]> = pes.iter().flat_map(|t| t[p].slices()).collect();
+        let ck_sl: Vec<&[Ck]> = cks.iter().flat_map(|t| t[p].slices()).collect();
         let tp0 = Instant::now();
         let mut g = std::mem::take(&mut st.g);
         // group events by person with a hash table (O(n)), clicks join the same groups
@@ -1182,24 +1183,26 @@ fn main() {
         g.tgid.resize(cap, 0);
         g.evg.clear();
         g.cnt.clear();
-        for r in ev_it() {
-            let mut s = (r.key as usize) & mask;
-            let gi = loop {
-                let k = g.tkey[s];
-                if k == r.key {
-                    break g.tgid[s];
-                }
-                if k == 0 {
-                    let id = g.cnt.len() as u32;
-                    g.tkey[s] = r.key;
-                    g.tgid[s] = id;
-                    g.cnt.push(0);
-                    break id;
-                }
-                s = (s + 1) & mask;
-            };
-            g.evg.push(gi);
-            g.cnt[gi as usize] += 1;
+        for sl in &ev_sl {
+            for r in sl.iter() {
+                let mut s = (r.key as usize) & mask;
+                let gi = loop {
+                    let k = g.tkey[s];
+                    if k == r.key {
+                        break g.tgid[s];
+                    }
+                    if k == 0 {
+                        let id = g.cnt.len() as u32;
+                        g.tkey[s] = r.key;
+                        g.tgid[s] = id;
+                        g.cnt.push(0);
+                        break id;
+                    }
+                    s = (s + 1) & mask;
+                };
+                g.evg.push(gi);
+                g.cnt[gi as usize] += 1;
+            }
         }
         let ng = g.cnt.len();
         g.start.clear();
@@ -1213,30 +1216,36 @@ fn main() {
         g.cur.extend_from_slice(&g.start[..ng]);
         g.sev.clear();
         g.sev.resize(n, Pe { key: 0, ts: 0, name: 0, price: 0, cat: 0, kind: 0 });
-        for (i, r) in ev_it().enumerate() {
-            let gi = g.evg[i] as usize;
-            let p = g.cur[gi] as usize;
-            g.sev[p] = *r;
-            g.cur[gi] += 1;
+        let mut i = 0usize;
+        for sl in &ev_sl {
+            for r in sl.iter() {
+                let gi = g.evg[i] as usize;
+                let pos = g.cur[gi] as usize;
+                g.sev[pos] = *r;
+                g.cur[gi] += 1;
+                i += 1;
+            }
         }
         g.ccnt.clear();
         g.ccnt.resize(ng, 0);
         g.cgid.clear();
-        for c in ck_it() {
-            let mut s = (c.key as usize) & mask;
-            let gi = loop {
-                let k = g.tkey[s];
-                if k == c.key {
-                    break g.tgid[s];
+        for sl in &ck_sl {
+            for c in sl.iter() {
+                let mut s = (c.key as usize) & mask;
+                let gi = loop {
+                    let k = g.tkey[s];
+                    if k == c.key {
+                        break g.tgid[s];
+                    }
+                    if k == 0 {
+                        break u32::MAX;
+                    }
+                    s = (s + 1) & mask;
+                };
+                g.cgid.push(gi);
+                if gi != u32::MAX {
+                    g.ccnt[gi as usize] += 1;
                 }
-                if k == 0 {
-                    break u32::MAX;
-                }
-                s = (s + 1) & mask;
-            };
-            g.cgid.push(gi);
-            if gi != u32::MAX {
-                g.ccnt[gi as usize] += 1;
             }
         }
         g.cstart.clear();
@@ -1250,12 +1259,16 @@ fn main() {
         g.ccur.extend_from_slice(&g.cstart[..ng]);
         g.sck.clear();
         g.sck.resize(run as usize, Ck { key: 0, ts: 0, cid: 0, camp: 0 });
-        for (i, c) in ck_it().enumerate() {
-            let gi = g.cgid[i];
-            if gi != u32::MAX {
-                let p = g.ccur[gi as usize] as usize;
-                g.sck[p] = *c;
-                g.ccur[gi as usize] += 1;
+        let mut i = 0usize;
+        for sl in &ck_sl {
+            for c in sl.iter() {
+                let gi = g.cgid[i];
+                if gi != u32::MAX {
+                    let pos = g.ccur[gi as usize] as usize;
+                    g.sck[pos] = *c;
+                    g.ccur[gi as usize] += 1;
+                }
+                i += 1;
             }
         }
         let mut u_name = std::mem::take(&mut st.u_name);
