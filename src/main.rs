@@ -721,6 +721,14 @@ fn add_interval(acc: &mut [[u64; 4]], nd: usize, sw_start: &[i64], sw_day: &[u32
         }
     }
 }
+/// User-mode CPU time of the calling thread (excludes page-fault / sys time), in nanoseconds.
+fn thread_user_ns() -> u64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: getrusage writes into the zeroed rusage struct we own; RUSAGE_THREAD is a valid selector on Linux.
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+    ru.ru_utime.tv_sec as u64 * 1_000_000_000 + ru.ru_utime.tv_usec as u64 * 1_000
+}
+static PH: [AtomicUsize; 4] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
 static FILE_ID: AtomicUsize = AtomicUsize::new(0);
 const FLUSH_ROWS: usize = 49_152;
 
@@ -787,8 +795,6 @@ fn sort_ts<T: Copy>(v: &mut [T], f: impl Fn(&T) -> i64 + Copy) {
 #[derive(Default)]
 struct P3 {
     g: Grp,
-    ev: Vec<Pe>,
-    ck: Vec<Ck>,
     u_name: Vec<u64>,
     u_day: Vec<i32>,
     u_sess: Vec<i32>,
@@ -1047,6 +1053,7 @@ fn main() {
     // pass 2: dedup, validate, person-map, scatter by person
     let pes: Vec<Vec<Blocks<Pe>>> = par(nt, NP, || S2 { out: new_blocks::<Pe>(PE_BLK), v: Vec::new(), tab: Vec::new(), surv: Vec::new() }, |s2, p| {
         let S2 { out: st, v, tab, surv } = s2;
+        let q0 = thread_user_ns();
         let n: usize = evs.iter().map(|t| t[p].len()).sum();
         v.clear();
         v.reserve(n);
@@ -1055,6 +1062,7 @@ fn main() {
                 v.extend_from_slice(s);
             }
         }
+        let q1 = thread_user_ns() - q0;
         let cap = (v.len() * 2 + 2).next_power_of_two();
         let mask = cap - 1;
         tab.clear();
@@ -1085,12 +1093,14 @@ fn main() {
                 s = (s + 1) & mask;
             }
         }
+        let q2 = thread_user_ns() - q0;
         surv.clear();
         for (i, r) in v.iter().enumerate() {
             if r.valid {
                 surv.push(i as u32);
             }
         }
+        let q3 = thread_user_ns() - q0;
         const LA: usize = 8;
         for k in 0..surv.len() {
             if k + LA < surv.len() {
@@ -1103,7 +1113,15 @@ fn main() {
             };
             st[(key >> 56) as usize].push(Pe { key, ts: r.ts, name, price: r.price, cat: r.cat, kind: r.kind });
         }
+        let q4 = thread_user_ns() - q0;
+        PH[0].fetch_add(q1 as usize, Ordering::Relaxed);
+        PH[1].fetch_add((q2 - q1) as usize, Ordering::Relaxed);
+        PH[2].fetch_add((q3 - q2) as usize, Ordering::Relaxed);
+        PH[3].fetch_add((q4 - q3) as usize, Ordering::Relaxed);
     }).into_iter().map(|s| s.out).collect();
+    if std::env::var("SS_TASKS").is_ok() {
+        eprintln!("  dedup phases (ms): gather {:.0}  table {:.0}  survivors {:.0}  link+scatter {:.0}", PH[0].load(Ordering::Relaxed) as f64 / 1e6, PH[1].load(Ordering::Relaxed) as f64 / 1e6, PH[2].load(Ordering::Relaxed) as f64 / 1e6, PH[3].load(Ordering::Relaxed) as f64 / 1e6);
+    }
     std::mem::forget(evs);
     lap("dedup");
 
@@ -1135,26 +1153,14 @@ fn main() {
         ..Default::default()
     }, |st, t_idx| {
         let p = order3[t_idx];
-        let mut ev = std::mem::take(&mut st.ev);
-        ev.clear();
-        ev.reserve(pes.iter().map(|t| t[p].len()).sum());
-        for t in &pes {
-            for s in t[p].slices() {
-                ev.extend_from_slice(s);
-            }
-        }
-        let mut ck = std::mem::take(&mut st.ck);
-        ck.clear();
-        ck.reserve(cks.iter().map(|t| t[p].len()).sum());
-        for t in &cks {
-            for s in t[p].slices() {
-                ck.extend_from_slice(s);
-            }
-        }
+        // iterate the block lists in place: no gather copy
+        let n: usize = pes.iter().map(|t| t[p].len()).sum();
+        let nck: usize = cks.iter().map(|t| t[p].len()).sum();
+        let ev_it = || pes.iter().flat_map(|t| t[p].slices()).flat_map(|s| s.iter());
+        let ck_it = || cks.iter().flat_map(|t| t[p].slices()).flat_map(|s| s.iter());
         let tp0 = Instant::now();
         let mut g = std::mem::take(&mut st.g);
         // group events by person with a hash table (O(n)), clicks join the same groups
-        let n = ev.len();
         let cap = (n * 2 + 2).next_power_of_two();
         let mask = cap - 1;
         g.tkey.clear();
@@ -1163,7 +1169,7 @@ fn main() {
         g.tgid.resize(cap, 0);
         g.evg.clear();
         g.cnt.clear();
-        for r in ev.iter() {
+        for r in ev_it() {
             let mut s = (r.key as usize) & mask;
             let gi = loop {
                 let k = g.tkey[s];
@@ -1194,7 +1200,7 @@ fn main() {
         g.cur.extend_from_slice(&g.start[..ng]);
         g.sev.clear();
         g.sev.resize(n, Pe { key: 0, ts: 0, name: 0, price: 0, cat: 0, kind: 0 });
-        for (i, r) in ev.iter().enumerate() {
+        for (i, r) in ev_it().enumerate() {
             let gi = g.evg[i] as usize;
             let p = g.cur[gi] as usize;
             g.sev[p] = *r;
@@ -1203,7 +1209,7 @@ fn main() {
         g.ccnt.clear();
         g.ccnt.resize(ng, 0);
         g.cgid.clear();
-        for c in ck.iter() {
+        for c in ck_it() {
             let mut s = (c.key as usize) & mask;
             let gi = loop {
                 let k = g.tkey[s];
@@ -1231,7 +1237,7 @@ fn main() {
         g.ccur.extend_from_slice(&g.cstart[..ng]);
         g.sck.clear();
         g.sck.resize(run as usize, Ck { key: 0, ts: 0, cid: 0, camp: 0 });
-        for (i, c) in ck.iter().enumerate() {
+        for (i, c) in ck_it().enumerate() {
             let gi = g.cgid[i];
             if gi != u32::MAX {
                 let p = g.ccur[gi as usize] as usize;
@@ -1426,7 +1432,7 @@ fn main() {
             }
         }
         if std::env::var("SS_TASKS").is_ok() && tp0.elapsed().as_millis() > 25 {
-            eprintln!("  p3 task {}: {} ev {} ck {} groups: build {:.1}ms sort {:.1}ms total {:.1}ms", p, n, ck.len(), ng, tp1.as_secs_f64() * 1e3, t_sort.as_secs_f64() * 1e3, tp0.elapsed().as_secs_f64() * 1e3);
+            eprintln!("  p3 task {}: {} ev {} ck {} groups: build {:.1}ms sort {:.1}ms total {:.1}ms", p, n, nck, ng, tp1.as_secs_f64() * 1e3, t_sort.as_secs_f64() * 1e3, tp0.elapsed().as_secs_f64() * 1e3);
         }
         if u_name.len() >= FLUSH_ROWS {
             flush_users(&udir, &ud_specs, &catnames, &u_name, &u_day, &u_sess, &u_ev, &u_rev, &u_top);
@@ -1437,8 +1443,6 @@ fn main() {
             u_rev.clear();
             u_top.clear();
         }
-        st.ev = ev;
-        st.ck = ck;
         st.g = g;
         st.u_name = u_name;
         st.u_day = u_day;
