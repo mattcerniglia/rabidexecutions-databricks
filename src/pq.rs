@@ -114,7 +114,7 @@ pub fn i64_page(v: &[i64]) -> Page {
 /// optional string page: `vals[i] == None` is null.
 pub fn opt_str_page(vals: &[Option<&'static [u8]>]) -> Page {
     let n = vals.len();
-    let groups = (n + 7) / 8;
+    let groups = n.div_ceil(8);
     let mut rle = Vec::new();
     varint(&mut rle, ((groups as u64) << 1) | 1);
     let base = rle.len();

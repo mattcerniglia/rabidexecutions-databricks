@@ -64,6 +64,8 @@ fn pack(s: &[u8]) -> u64 {
 }
 #[inline]
 fn unpack(p: u64) -> B {
+    // SAFETY: every packed value comes from `pack` on a slice of leaked (never unmapped or freed)
+    // input or file data, so the pointer/length pair stays valid for the whole process.
     unsafe { std::slice::from_raw_parts((p & 0xFFFF_FFFF_FFFF) as *const u8, (p >> 48) as usize) }
 }
 
@@ -224,7 +226,7 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |x| x == "csv") && p.is_file())
+            .filter(|p| p.extension().is_some_and(|x| x == "csv") && p.is_file())
             .collect(),
         Err(_) => vec![],
     };
@@ -237,6 +239,7 @@ fn map_file(p: &Path) -> B {
     if len == 0 {
         return &[];
     }
+    // SAFETY: the dataset is mounted read-only and is not modified while the process runs.
     let m = unsafe { Mmap::map(&f).expect("mmap") };
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
@@ -350,6 +353,7 @@ fn scan(d: &[u8], sc: &mut Scratch) {
 }
 /// Calls `f` with the N unquoted fields of every well-formed line of `d` (header already skipped).
 #[inline(always)]
+#[allow(clippy::needless_range_loop)] // indexed on purpose: unchecked accesses below mirror the checks above
 fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
     let last = match memchr::memrchr(b'\n', d) {
         Some(i) => i + 1,
@@ -369,7 +373,7 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
             // commas of this line
             let ok = ci + N - 1 <= cm.len()
                 && (N == 1 || (cm[ci + N - 2] as usize) < e)
-                && (ci + N - 1 >= cm.len() || (cm[ci + N - 1] as usize) > e);
+                && (ci + N > cm.len() || (cm[ci + N - 1] as usize) > e);
             if ok {
                 let mut fs: [B; N] = [&d[0..0]; N];
                 let mut s = ls;
@@ -414,6 +418,8 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
 fn populate(d: &[u8]) {
     let a = d.as_ptr() as usize & !4095;
     let l = d.as_ptr() as usize + d.len() - a;
+    // SAFETY: madvise only hints the kernel about pages of this mapping (a failure is ignored and the
+    // range is page-aligned); it never changes the contents or validity of the memory.
     unsafe {
         libc::madvise(a as *mut libc::c_void, l, 22); // MADV_POPULATE_READ
     }
@@ -477,6 +483,7 @@ struct LinkTab {
 impl LinkTab {
     #[inline(always)]
     fn prefetch(&self, h: u64) {
+        // SAFETY: i is masked to the table size, so the address is inside `keys`; a prefetch never faults.
         unsafe {
             let i = (h as usize) & self.mask;
             std::arch::x86_64::_mm_prefetch(self.keys.as_ptr().add(i) as *const i8, std::arch::x86_64::_MM_HINT_T0);
@@ -486,6 +493,7 @@ impl LinkTab {
     fn get(&self, h: u64) -> Option<[u64; 2]> {
         let mut i = (h as usize) & self.mask;
         loop {
+            // SAFETY: i is masked with `mask = capacity - 1`, and keys/vals both have `capacity` slots.
             let k = unsafe { *self.keys.get_unchecked(i) };
             if k == h {
                 return Some(unsafe { *self.vals.get_unchecked(i) });
@@ -697,7 +705,7 @@ const EV_BLK: usize = 2048; // 48 B records -> 96 KB blocks
 const PE_BLK: usize = 3072; // 32 B records -> 96 KB blocks
 
 fn json_str(j: &str, key: &str) -> String {
-    let i = j.find(&format!("\"{}\"", key)).expect("manifest key");
+    let i = j.find(&format!("\"{key}\"")).expect("manifest key");
     let r = &j[i + key.len() + 2..];
     let a = r.find('"').unwrap() + 1;
     let r = &r[a..];
@@ -749,7 +757,7 @@ fn flush_users(dir: &Path, specs: &[pq::Spec], cats: &[B], name: &[u64], day: &[
         pq::opt_str_page(&tops),
     ];
     let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
-    write_file(dir, &format!("part-{:05}.parquet", id), pq::file_bytes(specs, &pages, n));
+    write_file(dir, &format!("part-{id:05}.parquet"), pq::file_bytes(specs, &pages, n));
 }
 struct WhaleTimer(Option<Instant>, usize, usize);
 impl Drop for WhaleTimer {
@@ -847,6 +855,7 @@ fn main() {
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |s: &str| {
         if verbose {
+            // SAFETY: getrusage fills the zeroed rusage struct we own.
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
             unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
             let f = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
@@ -1421,8 +1430,8 @@ fn main() {
                     k = j;
                 }
             } else {
-                for j in lo..hi {
-                    let c = cs[j].camp as usize;
+                for click in &cs[lo..hi] {
+                    let c = click.camp as usize;
                     st.cnt[c] -= 1;
                     if st.cnt[c] == 0 {
                         let pi = st.pos[c] as usize;
