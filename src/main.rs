@@ -362,8 +362,10 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
         let (mut ci, mut ls, mut pq_) = (0usize, 0usize, 0u32);
         for (li, &e) in nl.iter().enumerate() {
             let e = e as usize;
-            let qc = (nq[li] - pq_) as usize;
-            pq_ = nq[li];
+            // SAFETY: `nq` has exactly one entry per newline in `nl` (pushed together in `scan`).
+            let nqv = unsafe { *nq.get_unchecked(li) };
+            let qc = (nqv - pq_) as usize;
+            pq_ = nqv;
             // commas of this line
             let ok = ci + N - 1 <= cm.len()
                 && (N == 1 || (cm[ci + N - 2] as usize) < e)
@@ -374,8 +376,10 @@ fn lines<const N: usize>(d: B, sc: &mut Scratch, mut f: impl FnMut([B; N])) {
                 let mut quoted = 0usize;
                 let mut good = true;
                 for j in 0..N {
-                    let fe = if j + 1 < N { cm[ci + j] as usize } else { e };
-                    let raw = &d[s..fe];
+                    // SAFETY: `ok` established that this line has N-1 commas at cm[ci..ci+N-1], all inside
+                    // (ls-1, e) with e < last <= d.len(); positions are strictly increasing, so s <= fe.
+                    let fe = if j + 1 < N { unsafe { *cm.get_unchecked(ci + j) as usize } } else { e };
+                    let raw = unsafe { d.get_unchecked(s..fe) };
                     s = fe + 1;
                     if !raw.is_empty() && raw[0] == b'"' {
                         let l = raw.len();
