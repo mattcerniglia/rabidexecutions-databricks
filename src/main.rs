@@ -28,12 +28,17 @@ fn hash(b: &[u8]) -> u64 {
     let rd8 = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
     let rd4 = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as u64;
     if l >= 8 {
-        let mut i = 0;
-        while i + 8 < l {
-            s = mix(s ^ rd8(i), P1);
-            i += 8;
+        if l <= 16 {
+            // two overlapping 8-byte reads cover the whole key: one multiply
+            s = mix(rd8(0) ^ P1, rd8(l - 8) ^ s);
+        } else {
+            let mut i = 0;
+            while i + 8 < l {
+                s = mix(s ^ rd8(i), P1);
+                i += 8;
+            }
+            s = mix(s ^ rd8(l - 8), P2);
         }
-        s = mix(s ^ rd8(l - 8), P2);
     } else if l >= 4 {
         s = mix(s ^ rd4(0) ^ (rd4(l - 4) << 32), P2);
     } else if l > 0 {
@@ -303,9 +308,18 @@ struct Scratch {
 }
 #[inline(always)]
 fn push_bits(out: &mut Vec<u32>, mut m: u32, base: u32) {
-    while m != 0 {
-        out.push(base + m.trailing_zeros());
-        m &= m - 1;
+    let mut len = out.len();
+    debug_assert!(len + 32 <= out.capacity());
+    let p = out.as_mut_ptr();
+    // SAFETY: `scan` reserved capacity for one entry per input byte plus slack before the first call,
+    // and each call appends at most 32 positions per 32 bytes scanned, so `len` stays below capacity.
+    unsafe {
+        while m != 0 {
+            *p.add(len) = base + m.trailing_zeros();
+            len += 1;
+            m &= m - 1;
+        }
+        out.set_len(len);
     }
 }
 fn scan(d: &[u8], sc: &mut Scratch) {
@@ -314,6 +328,9 @@ fn scan(d: &[u8], sc: &mut Scratch) {
     sc.nl.clear();
     sc.nq.clear();
     let n = d.len();
+    sc.cm.reserve(n + 64);
+    sc.nl.reserve(n + 64);
+    sc.nq.reserve(n + 64);
     let mut i = 0usize;
     let mut qrun = 0u32;
     // SAFETY: AVX2 is enabled for the whole crate via target-cpu=x86-64-v3 (.cargo/config.toml);
@@ -330,8 +347,15 @@ fn scan(d: &[u8], sc: &mut Scratch) {
             push_bits(&mut sc.cm, mc, i as u32);
             while mn != 0 {
                 let k = mn.trailing_zeros();
-                sc.nl.push(i as u32 + k);
-                sc.nq.push(qrun + (mq & ((1u32 << k) - 1)).count_ones());
+                let (ln, lq) = (sc.nl.len(), sc.nq.len());
+                debug_assert!(ln < sc.nl.capacity() && lq < sc.nq.capacity());
+                // SAFETY: capacity n + 64 was reserved above and at most one newline per input byte is recorded.
+                unsafe {
+                    *sc.nl.as_mut_ptr().add(ln) = i as u32 + k;
+                    *sc.nq.as_mut_ptr().add(lq) = qrun + (mq & ((1u32 << k) - 1)).count_ones();
+                    sc.nl.set_len(ln + 1);
+                    sc.nq.set_len(lq + 1);
+                }
                 mn &= mn - 1;
             }
             qrun += mq.count_ones();
@@ -646,13 +670,28 @@ fn make_ev(f: [B; 7], ws: i64, we: i64, products: &Small, pcat: &[u8], unknown_c
     if let Some(t) = tsv {
         tsx = t;
         if t >= ws && t < we && !user.is_empty() && !pr.is_empty() && ing != i64::MAX && ing - t <= DAY {
-            match ty {
-                b"view" => valid = true,
-                b"cart" => {
+            // compare the type bytes as integers (no memcmp call): "view", "cart" and "purchase" only
+            let tcode = match ty.len() {
+                4 => {
+                    let w = u32::from_le_bytes([ty[0], ty[1], ty[2], ty[3]]);
+                    if w == u32::from_le_bytes(*b"view") {
+                        1
+                    } else if w == u32::from_le_bytes(*b"cart") {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                8 if u64::from_le_bytes([ty[0], ty[1], ty[2], ty[3], ty[4], ty[5], ty[6], ty[7]]) == u64::from_le_bytes(*b"purchase") => 3,
+                _ => 0,
+            };
+            match tcode {
+                1 => valid = true,
+                2 => {
                     kind = 1;
                     valid = true
                 }
-                b"purchase" => {
+                3 => {
                     kind = 2;
                     if let Some(p) = parse_price(price) {
                         pv = p;
@@ -870,17 +909,13 @@ fn main() {
     // products / categories
     let prod = read_small(&data.join("products.csv"));
     let mut pl: Vec<(B, B)> = vec![];
-    let mut first = true;
-    for_lines(prod, |l| {
-        if first {
-            first = false;
-            return;
-        }
-        if let Some([a, b]) = split::<2>(l) {
-            pl.push((a, b));
-        }
-    });
-    let mut catnames: Vec<B> = pl.iter().map(|x| x.1).collect();
+    let prod_body = &prod[memchr::memchr(b'\n', prod).map_or(prod.len(), |i| i + 1)..];
+    lines::<2>(prod_body, &mut Scratch::default(), |[a, b]| pl.push((a, b)));
+    let mut seen: HM<B> = HM::default();
+    for (_, c) in &pl {
+        seen.entry(hash(c)).or_insert(c);
+    }
+    let mut catnames: Vec<B> = seen.values().copied().collect();
     catnames.push(b"unknown");
     catnames.sort();
     catnames.dedup();
@@ -897,7 +932,7 @@ fn main() {
     let camp = read_small(&data.join("campaigns.csv"));
     let mut campaigns = Small { m: HM::default(), names: vec![] };
     let mut channels: Vec<B> = vec![];
-    first = true;
+    let mut first = true;
     for_lines(camp, |l| {
         if first {
             first = false;
